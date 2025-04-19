@@ -6,12 +6,19 @@ import random
 from sentence_transformers import SentenceTransformer
 from resemblyzer import VoiceEncoder, wav_to_mel_spectrogram
 import torch.nn.functional as F
-from itertools import islice
 import soundfile as sf
 import os
 import logging
-from datasets import load_dataset, Dataset, concatenate_datasets
+from datasets import load_from_disk, Audio
 from voice_to_embedding import Voice2Embedding
+
+# Initialize session state
+if 'selected_idx' not in st.session_state:
+    st.session_state.selected_idx = 0
+if 'text_input' not in st.session_state:
+    st.session_state.text_input = ""
+if 'similarity_result' not in st.session_state:
+    st.session_state.similarity_result = None
 
 SPLIT = 'train'
 
@@ -25,100 +32,62 @@ logger = logging.getLogger(__name__)
 
 
 @st.cache_resource
-def merge_datasets_with_audio(id_column="original_path"):
+def load_cotts_dataset():
     """
-    Replicating the exact same function from train.py
+    Load the CoTTS dataset the same way as in the training script
     """
-    dataset_name = "parler-tts/mls_eng"
-    metadata_dataset_name = "parler-tts/mls-eng-speaker-descriptions"
+    try:
+        logger.info("Loading CoTTS dataset from disk")
+        dataset = load_from_disk("/Users/galbloch/Desktop/school/git/ANLP/datasets/CoTTS_dataset")
+        dataset = dataset.cast_column("audio", Audio())
 
-    logger.info(f"Loading audio dataset: {dataset_name}")
-    # Load as streaming but convert to a dictionary of limited datasets
-    loader = load_dataset(dataset_name, streaming=True)
+        # Rename + clean the same way as in training
+        dataset = dataset.rename_column("description", "text_description").remove_columns(["segment_id"])
 
-    # Create a dict to hold limited data by split
-    dataset = {}
-    for split_name, max_examples in zip([SPLIT], [100]):
-        logger.info(f"Taking first {max_examples} examples from '{split_name}' split")
-        split_data = list(islice(loader[split_name], max_examples))
-        # Convert the list of examples to a dataset
-        dataset[split_name] = Dataset.from_list(split_data)
+        # Split into train and validation (same as in training)
+        split_dataset = dataset.train_test_split(test_size=0.1, seed=42)
 
-    logger.info(f"Loading metadata dataset: {metadata_dataset_name}")
-    metadata_dataset = load_dataset(metadata_dataset_name)
-
-    merged_data = {}
-
-    for split in dataset:
-        if split in metadata_dataset:
-            logger.info(f"Merging '{split}' split...")
-
-            # Limit metadata to match the audio dataset size
-            metadata_split = metadata_dataset[split].select(
-                range(min(len(dataset[split]), len(metadata_dataset[split]))))
-
-            # Get the list of columns from both datasets
-            audio_columns = dataset[split].column_names
-            metadata_columns = metadata_split.column_names
-
-            # Find common columns that need to be renamed in metadata dataset
-            duplicated_columns = [col for col in metadata_columns if col in audio_columns and col != id_column]
-
-            # Rename the duplicated columns in metadata dataset
-            for col in duplicated_columns:
-                metadata_split = metadata_split.rename_column(col, f"metadata_{col}")
-
-            # Rename the ID column to make validation easier
-            metadata_split = metadata_split.rename_column(id_column, f"metadata_{id_column}")
-
-            # Concatenate datasets
-            merged_split = concatenate_datasets([dataset[split], metadata_split], axis=1)
-
-            # Validate alignment
-            if len(merged_split.filter(lambda id1, id2: id1 != id2,
-                                       input_columns=[id_column, f"metadata_{id_column}"])) != 0:
-                raise ValueError(f"Mismatch in IDs after merging on split {split}")
-
-            merged_data[split] = merged_split
-        else:
-            logger.warning(f"Split '{split}' is missing from the metadata dataset.")
-
-    logger.info("✅ Dataset successfully merged!")
-    return merged_data
+        logger.info(
+            f"✅ Successfully loaded dataset with {len(split_dataset['train'])} train and {len(split_dataset['test'])} test samples")
+        return split_dataset
+    except Exception as e:
+        logger.error(f"Error loading dataset: {e}")
+        st.error(f"Failed to load dataset: {e}")
+        return None
 
 
 def load_audio_file(audio_data):
     """
-    Loads audio from various sources, matching the approach in the training script.
-    Handles both file paths and streamed audio data.
+    Loads audio from various sources
     """
     try:
-        # If it's a path, try to load it
-        if isinstance(audio_data, dict) and "path" in audio_data:
-            audio_path = audio_data["path"]
-            if os.path.exists(audio_path):
-                waveform, sample_rate = torchaudio.load(audio_path)
-                wav = waveform.mean(dim=0).numpy()
-                return wav, audio_path
-
-        # If it's streamed data or array data
+        # Handle HuggingFace dataset audio format
         if isinstance(audio_data, dict) and "array" in audio_data and "sampling_rate" in audio_data:
             wav = np.array(audio_data["array"])
             if wav.ndim > 1:  # Multi-channel audio
                 wav = np.mean(wav, axis=0)
-            return wav, None
+            return wav, audio_data.get("sampling_rate", 16000)
 
-        # Try using the raw audio data if available
-        if hasattr(audio_data, "array") and hasattr(audio_data, "sampling_rate"):
-            wav = np.array(audio_data["array"])
-            if wav.ndim > 1:  # Multi-channel audio
-                wav = np.mean(wav, axis=0)
-            return wav, None
+        # Handle file path
+        elif isinstance(audio_data, dict) and "path" in audio_data:
+            audio_path = audio_data["path"]
+            if os.path.exists(audio_path):
+                waveform, sample_rate = torchaudio.load(audio_path)
+                wav = waveform.mean(dim=0).numpy()
+                return wav, sample_rate
+
+        # Try generic loading
+        elif audio_data is not None:
+            if hasattr(audio_data, "array"):
+                wav = np.array(audio_data.array)
+                if wav.ndim > 1:
+                    wav = np.mean(wav, axis=0)
+                return wav, getattr(audio_data, "sampling_rate", 16000)
 
     except Exception as e:
         st.error(f"Error loading audio: {e}")
 
-    return np.zeros(16000), None  # Return empty audio as fallback
+    return np.zeros(16000), 16000  # Return empty audio as fallback
 
 
 @st.cache_resource
@@ -130,37 +99,17 @@ def load_model():
     try:
         checkpoint = torch.load("best_voice2embedding_model.pt", map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
+        logger.info("Successfully loaded model weights")
     except Exception as e:
-        st.error(f"Error loading model: {e}")
+        logger.warning(f"Could not load model weights: {e}. Using uninitialized model.")
     model.to(device)
     model.eval()
     return model, dense_embedding_model, device
 
 
-@st.cache_resource
-def load_test_samples():
-    try:
-        # Use the exact same loading method as train.py
-        dataset = merge_datasets_with_audio()
-        if SPLIT not in dataset:
-            st.error("Test split not found in dataset")
-            return []
-
-        # Take a sample of the dev set
-        test_samples = dataset[SPLIT].select(range(min(100, len(dataset[SPLIT]))))
-        samples = random.sample(list(test_samples), min(100, len(test_samples)))
-
-        # Debug information
-        st.write(f"Successfully loaded {len(samples)} samples")
-        return samples
-    except Exception as e:
-        st.error(f"Error loading samples: {e}")
-        return []
-
-
 def extract_audio_embedding(audio_data, model, device):
     try:
-        wav, _ = load_audio_file(audio_data)
+        wav, sample_rate = load_audio_file(audio_data)
         if wav is None or len(wav) == 0:
             st.error("Failed to load audio data")
             return None
@@ -182,7 +131,7 @@ def extract_text_embedding(text, text_model):
 
 def cosine_similarity(emb1, emb2):
     if emb1 is None or emb2 is None or emb1.shape[1] != emb2.shape[1]:
-        return np.array([[0]])  # Return zero similarity for invalid inputs
+        return 0  # Return zero similarity for invalid inputs
 
     # Convert to PyTorch tensors
     tensor1 = torch.tensor(emb1, dtype=torch.float32)
@@ -191,48 +140,120 @@ def cosine_similarity(emb1, emb2):
     # Compute cosine similarity along the feature dimension
     sim = F.cosine_similarity(tensor1, tensor2, dim=1)
 
-    # Return 1 - mean similarity, wrapped as a numpy array
-    return np.array([[1 - sim.mean().item()]])
+    # Return similarity score (not distance)
+    return sim.mean().item()
+
+
+def update_selected_idx():
+    """Update the selected index without triggering a refresh"""
+    selected_option = st.session_state.sample_selector
+    st.session_state.selected_idx = audio_options[selected_option]
+
+    # Update the text input with the new sample's description
+    selected_sample = sample_dataset[st.session_state.selected_idx]
+    st.session_state.text_input = selected_sample['text_description']
+
+
+def update_text_input():
+    """Keep track of text input changes"""
+    # This just stores the current text input value in session state
+    pass  # The actual update happens automatically through the key
+
+
+def compare_voice_to_text():
+    """Process the comparison when the button is clicked"""
+    selected_sample = sample_dataset[st.session_state.selected_idx]
+    text_input = st.session_state.text_input
+
+    # Extract embeddings
+    audio_embedding = extract_audio_embedding(selected_sample['audio'], model, device)
+    text_embedding = extract_text_embedding(text_input, text_model)
+
+    if audio_embedding is not None and text_embedding is not None:
+        # Calculate similarity
+        similarity = cosine_similarity(audio_embedding, text_embedding)
+
+        # Store in session state
+        st.session_state.similarity_result = similarity
+    else:
+        st.session_state.similarity_result = None
 
 
 st.title("Voice-to-Text Embedding Demo")
-st.write("Select an instance from the dataset or upload your own audio file.")
+st.write("Select an instance from the CoTTS dataset to compare voice characteristics with text descriptions.")
 
+# Load the model and dataset
 model, text_model, device = load_model()
-samples = load_test_samples()
+dataset = load_cotts_dataset()
 
-if not samples:
-    st.error("No samples loaded. Please check your dataset configuration.")
+if dataset is None:
+    st.error("Failed to load dataset. Please check your dataset path.")
 else:
-    audio_options = {f"Sample {i + 1} - {sample.get('text_description', 'No description')}": sample
-                     for i, sample in enumerate(samples)}
-    selected_sample = st.selectbox("Choose an audio sample", list(audio_options.keys()))
-    selected_audio = audio_options[selected_sample]
+    # Get a sample of the dataset
+    sample_size = min(100, len(dataset['train']))
 
-    # Display the audio if possible
-    wav, audio_path = load_audio_file(selected_audio.get("audio", {}))
-    if audio_path and os.path.exists(audio_path):
-        st.audio(audio_path)
-    elif len(wav) > 0:
+    # Use consistent sampling with fixed seed for stability
+    random.seed(42)
+    sample_indices = random.sample(range(len(dataset['train'])), sample_size)
+    sample_dataset = dataset['train'].select(sample_indices)
+
+    # Create display options with indices
+    audio_options = {f"Sample {i + 1} - {sample['text_description'][:50]}...": i
+                     for i, sample in enumerate(sample_dataset)}
+
+    # Use on_change callback to update session state without form submission
+    st.selectbox(
+        "Choose an audio sample",
+        list(audio_options.keys()),
+        key="sample_selector",
+        on_change=update_selected_idx,
+        index=list(audio_options.keys()).index(next((k for k, v in audio_options.items()
+                                                     if v == st.session_state.selected_idx),
+                                                    list(audio_options.keys())[0]))
+    )
+
+    # Get the selected sample using the stored index
+    selected_sample = sample_dataset[st.session_state.selected_idx]
+
+    # Display sample information
+    st.subheader("Current sample")
+    st.write(f"**Speaker description:** {selected_sample['text_description']}")
+
+    # Process and display audio
+    wav, sample_rate = load_audio_file(selected_sample['audio'])
+    if len(wav) > 0:
         # For streamed data, create a temporary file
-        temp_path = os.path.join(AUDIO_CACHE_DIR, "temp_audio.wav")
-        sf.write(temp_path, wav, 16000)
+        temp_path = os.path.join(AUDIO_CACHE_DIR, f"temp_audio_{st.session_state.selected_idx}.wav")
+        sf.write(temp_path, wav, sample_rate)
         st.audio(temp_path)
     else:
         st.error("Unable to play audio for this sample")
 
-    st.write(f"Text description: {selected_audio.get('text_description', 'No description')}")
+    # Create a form to prevent auto-submission on Enter key
+    with st.form(key="text_comparison_form"):
+        # Get user input with the current sample's description as default
+        if not st.session_state.text_input and selected_sample['text_description']:
+            st.session_state.text_input = selected_sample['text_description']
 
-    text_input = st.text_input("Enter a description of the voice")
+        st.text_area("Enter a description of the voice",
+                     key="text_input",
+                     height=100)
 
-    if text_input:
-        st.write("Processing the audio...")
-        audio_embedding = extract_audio_embedding(selected_audio.get("audio", {}), model, device)
-        if audio_embedding is not None:
-            text_embedding = extract_text_embedding(text_input, text_model)
-            similarity = cosine_similarity(audio_embedding, text_embedding)
-            st.write(f"Cosine Similarity between Voice and Text: {similarity[0][0]:.4f}")
+        # Form submission button
+        submit_button = st.form_submit_button("Compare Voice to Text", on_click=compare_voice_to_text)
+
+    # Display results (outside the form)
+    if st.session_state.similarity_result is not None:
+        similarity = st.session_state.similarity_result
+
+        # Display results
+        st.success(f"Processing complete!")
+        st.metric("Cosine Similarity", f"{similarity:.4f}")
+
+        # Interpretation
+        if similarity > 0.7:
+            st.write("✅ High similarity - the description matches the voice well!")
+        elif similarity > 0.4:
+            st.write("🟡 Moderate similarity - the description partially matches the voice.")
         else:
-            st.error("Error processing audio file.")
-    else:
-        st.write("Please enter a text description.")
+            st.write("❌ Low similarity - the description doesn't match the voice well.")
