@@ -222,6 +222,7 @@ class PromptCache:
         self.cache[prompt_hash] = response
         self._save_cache()
 
+prompt_cache = PromptCache()
 
 def generate_negated_description(text):
     """Generate a negated version of the description using Ollama and Llama3.2"""
@@ -237,10 +238,16 @@ def generate_negated_description(text):
 
     Original description: "{text}"
 
-    Negated description:
+    your answer should only include a sentence with the negated characteristics.
     """
+    cached_response = prompt_cache.get(prompt)
+    if cached_response:
+        return cached_response
 
-    return ollama.generate(model="llama3.2", prompt=prompt).response
+    negated_prompt = ollama.generate(model="llama3.2", prompt=prompt).response
+    logger.info(f"generated negated prompt: {negated_prompt}\nfor prompt: {text}")
+    prompt_cache.set(text, negated_prompt)
+    return negated_prompt
 
 
 # Min-max normalization for loss computation
@@ -366,7 +373,7 @@ def main():
 
             train_loss += loss.item()
 
-        # [Similar updates for validation loop]
+        avg_train_loss = train_loss / len(train_loader)
 
         # Validation - now with negated descriptions too
         model.eval()
