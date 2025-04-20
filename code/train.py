@@ -1,4 +1,8 @@
+import hashlib
+import json
 from itertools import islice
+
+import ollama
 
 from voice_to_embedding import Voice2Embedding
 from sentence_transformers import SentenceTransformer
@@ -186,20 +190,111 @@ def pad_sequence(sequences, batch_first=False, padding_value=0.0):
         return padded_tensor.transpose(0, 1)
 
 
+class PromptCache:
+    def __init__(self, cache_dir="./prompt_cache"):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        self.cache = self._load_cache()
+
+    def _get_cache_path(self):
+        return os.path.join(self.cache_dir, "prompt_cache.json")
+
+    def _load_cache(self):
+        cache_path = self._get_cache_path()
+        if os.path.exists(cache_path):
+            with open(cache_path, 'r') as f:
+                return json.load(f)
+        return {}
+
+    def _save_cache(self):
+        with open(self._get_cache_path(), 'w') as f:
+            json.dump(self.cache, f)
+
+    def get_hash(self, prompt):
+        return hashlib.md5(prompt.encode()).hexdigest()
+
+    def get(self, prompt):
+        prompt_hash = self.get_hash(prompt)
+        return self.cache.get(prompt_hash)
+
+    def set(self, prompt, response):
+        prompt_hash = self.get_hash(prompt)
+        self.cache[prompt_hash] = response
+        self._save_cache()
+
+
+def generate_negated_description(text):
+    """Generate a negated version of the description using Ollama and Llama3.2"""
+
+    prompt = f"""
+    Please negate the key characteristics in this voice description by changing attributes to their opposites.
+    For example:
+    - Change gender (male to female, female to male)
+    - Change age (young to old, old to young)
+    - Change pace (fast to slow, slow to fast)
+    - Change pitch (high to low, low to high)
+    - Change accent (British to American, etc.)
+
+    Original description: "{text}"
+
+    Negated description:
+    """
+
+    return ollama.generate(model="llama3.2", prompt=prompt)
+
+
+# Min-max normalization for loss computation
+def min_max_normalize(tensor):
+    """Apply min-max normalization to tensor values to range [0, 1]"""
+    min_val = torch.min(tensor)
+    max_val = torch.max(tensor)
+    if min_val == max_val:
+        return torch.zeros_like(tensor)
+    return (tensor - min_val) / (max_val - min_val)
+
+
+def contrastive_loss(speech_emb, text_emb, neg_text_emb, margin=0.5):
+    """
+    Contrastive loss using min-max normalization:
+    - Maximize similarity between speech and positive text
+    - Minimize similarity between speech and negative text
+    """
+    # Positive similarity (speech and matching text)
+    pos_sim = F.cosine_similarity(speech_emb, text_emb, dim=1)
+
+    # Negative similarity (speech and negated text)
+    neg_sim = F.cosine_similarity(speech_emb, neg_text_emb, dim=1)
+
+    # Normalize similarities
+    pos_sim_norm = min_max_normalize(pos_sim)
+    neg_sim_norm = min_max_normalize(neg_sim)
+
+    # Loss: minimize positive distance, maximize negative distance
+    loss = (1 - pos_sim_norm) + torch.clamp(neg_sim_norm - margin, min=0)
+
+    return loss.mean()
+
+
+# Update the collate_fn to include negated descriptions
 def collate_fn(batch):
-    """Custom collate function to handle variable length audio and process them for the VoiceEncoder"""
+    """Custom collate function with negated descriptions"""
     wavs = [item["audio"]["array"] for item in batch]
     descriptions = [item["text_description"] for item in batch]
 
+    # Generate negated descriptions
+    negated_descriptions = []
+    for desc in tqdm(descriptions, desc="Generating negated descriptions"):
+        negated_desc = generate_negated_description(desc)
+        negated_descriptions.append(negated_desc)
+
     # Process each audio to the format expected by VoiceEncoder
-    # VoiceEncoder expects mel spectrograms in a specific format
     mel_specs = []
     for wav in wavs:
         # Convert to mel spectrogram according to the requirements of the VoiceEncoder
         mel_spec = wav_to_mel_spectrogram(wav)
         mel_specs.append(torch.tensor(mel_spec))
 
-    return mel_specs, descriptions
+    return mel_specs, descriptions, negated_descriptions
 
 
 def main():
@@ -247,25 +342,23 @@ def main():
         model.train()
         train_loss = 0.0
 
-        for mel_specs, descriptions in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} - Training"):
+        for mel_specs, descriptions, negated_descriptions in tqdm(train_loader,
+                                                                  desc=f"Epoch {epoch + 1}/{num_epochs} - Training"):
             # Process each mel spectrogram in the batch
             speech_embeddings = []
             for mel_spec in mel_specs:
-                # Move to device and ensure correct shape
                 mel_spec = mel_spec.to(device)
-
-                # REMOVE the torch.no_grad() here - we need gradients for training
-                emb = model(mel_spec.unsqueeze(0))  # Add batch dimension
+                emb = model(mel_spec.unsqueeze(0))
                 speech_embeddings.append(emb)
 
-            # Stack all embeddings
             speech_emb = torch.cat(speech_embeddings, dim=0)
 
-            # Get text embeddings
+            # Get embeddings for positive and negative text descriptions
             text_emb = get_text_embedding(descriptions, dense_embedding_model).to(device)
+            neg_text_emb = get_text_embedding(negated_descriptions, dense_embedding_model).to(device)
 
-            # Calculate loss
-            loss = cosine_similarity_loss(speech_emb, text_emb)
+            # Calculate contrastive loss with min-max normalization
+            loss = contrastive_loss(speech_emb, text_emb, neg_text_emb)
 
             optimizer.zero_grad()
             loss.backward()
@@ -273,15 +366,15 @@ def main():
 
             train_loss += loss.item()
 
-        avg_train_loss = train_loss / len(train_loader)
+        # [Similar updates for validation loop]
 
-        # Validation - similar approach
+        # Validation - now with negated descriptions too
         model.eval()
         val_loss = 0.0
 
         with torch.no_grad():
-            for mel_specs, descriptions in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{num_epochs} - Validation"):
-                # Process each mel spectrogram in the batch
+            for mel_specs, descriptions, negated_descriptions in tqdm(val_loader,
+                                                                      desc=f"Epoch {epoch + 1}/{num_epochs} - Validation"):
                 speech_embeddings = []
                 for mel_spec in mel_specs:
                     mel_spec = mel_spec.to(device)
@@ -290,8 +383,9 @@ def main():
 
                 speech_emb = torch.cat(speech_embeddings, dim=0)
                 text_emb = get_text_embedding(descriptions, dense_embedding_model).to(device)
+                neg_text_emb = get_text_embedding(negated_descriptions, dense_embedding_model).to(device)
 
-                loss = cosine_similarity_loss(speech_emb, text_emb)
+                loss = contrastive_loss(speech_emb, text_emb, neg_text_emb)
                 val_loss += loss.item()
 
         avg_val_loss = val_loss / len(val_loader)
