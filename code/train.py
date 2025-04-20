@@ -240,7 +240,7 @@ def generate_negated_description(text):
     Negated description:
     """
 
-    return ollama.generate(model="llama3.2", prompt=prompt)
+    return ollama.generate(model="llama3.2", prompt=prompt).response
 
 
 # Min-max normalization for loss computation
