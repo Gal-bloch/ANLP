@@ -246,7 +246,7 @@ def generate_negated_description(text):
 
     negated_prompt = ollama.generate(model="llama3.2", prompt=prompt).response
     logger.info(f"generated negated prompt: {negated_prompt}\nfor prompt: {text}")
-    prompt_cache.set(text, negated_prompt)
+    prompt_cache.set(prompt, negated_prompt)
     return negated_prompt
 
 
@@ -319,7 +319,7 @@ def main():
     dataset = dataset.rename_column("description", "text_description").remove_columns(["segment_id"])
 
     # Filter down to a max number of samples (if needed)
-    max_samples = 1000
+    max_samples = 50000
     if max_samples < len(dataset):
         dataset = dataset.select(range(max_samples))
 
