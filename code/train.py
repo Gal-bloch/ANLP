@@ -308,6 +308,24 @@ def contrastive_loss(speech_emb, text_emb, neg_text_emb, margin=0.5):
 
     return loss.mean()
 
+def info_nce_loss(speech_emb, text_emb, temperature=0.07):
+    """
+    InfoNCE loss with in-batch negatives (cross-modal)
+    speech_emb: (B, D)
+    text_emb: (B, D)
+    """
+    # Normalize
+    speech_emb = F.normalize(speech_emb, p=2, dim=1)
+    text_emb = F.normalize(text_emb, p=2, dim=1)
+
+    logits = torch.matmul(speech_emb, text_emb.T) / temperature  # (B, B)
+    labels = torch.arange(len(speech_emb)).to(speech_emb.device)  # Ground truth is the diagonal
+
+    loss_i2t = F.cross_entropy(logits, labels)       # Speech → Text
+    loss_t2i = F.cross_entropy(logits.T, labels)     # Text → Speech
+
+    return (loss_i2t + loss_t2i) / 2
+
 
 def collate_fn(batch):
     """Custom collate function using pre-generated negated descriptions"""
@@ -368,21 +386,19 @@ def main():
 
         for mel_specs, descriptions, negated_descriptions in tqdm(train_loader,
                                                                   desc=f"Epoch {epoch + 1}/{num_epochs} - Training"):
-            # Process each mel spectrogram in the batch
             speech_embeddings = []
             for mel_spec in mel_specs:
                 mel_spec = mel_spec.to(device)
                 emb = model(mel_spec.unsqueeze(0))
                 speech_embeddings.append(emb)
 
-            speech_emb = torch.cat(speech_embeddings, dim=0)
-
-            # Get embeddings for positive and negative text descriptions
+            speech_emb = torch.cat(speech_embeddings, dim=0)  # (B, D)
             text_emb = get_text_embedding(descriptions, dense_embedding_model).to(device)
             neg_text_emb = get_text_embedding(negated_descriptions, dense_embedding_model).to(device)
 
-            # Calculate contrastive loss with min-max normalization
-            loss = contrastive_loss(speech_emb, text_emb, neg_text_emb)
+            # Choose ONE loss function
+            # loss = contrastive_loss_improved(speech_emb, text_emb, neg_text_emb)
+            loss = info_nce_loss(speech_emb, text_emb)
 
             optimizer.zero_grad()
             loss.backward()
