@@ -309,24 +309,13 @@ def contrastive_loss(speech_emb, text_emb, neg_text_emb, margin=0.5):
     return loss.mean()
 
 
-# Update the collate_fn to include negated descriptions
 def collate_fn(batch):
-    """Custom collate function with negated descriptions"""
+    """Custom collate function using pre-generated negated descriptions"""
     wavs = [item["audio"]["array"] for item in batch]
     descriptions = [item["text_description"] for item in batch]
+    negated_descriptions = [item["negated_prompt"] for item in batch]  # Use cached/generated values
 
-    # Generate negated descriptions
-    negated_descriptions = []
-    for desc in tqdm(descriptions, desc="Generating negated descriptions"):
-        negated_desc = generate_negated_description(desc)
-        negated_descriptions.append(negated_desc)
-
-    # Process each audio to the format expected by VoiceEncoder
-    mel_specs = []
-    for wav in wavs:
-        # Convert to mel spectrogram according to the requirements of the VoiceEncoder
-        mel_spec = wav_to_mel_spectrogram(wav)
-        mel_specs.append(torch.tensor(mel_spec))
+    mel_specs = [torch.tensor(wav_to_mel_spectrogram(wav)) for wav in wavs]
 
     return mel_specs, descriptions, negated_descriptions
 
