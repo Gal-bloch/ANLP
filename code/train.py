@@ -249,6 +249,33 @@ def generate_negated_description(text):
     prompt_cache.set(prompt, negated_prompt)
     return negated_prompt
 
+def process_dataset_with_negated_prompts(dataset):
+    """Add negated_prompt column to dataset if it doesn't exist already"""
+
+    # Check if column already exists
+    if "negated_prompt" in dataset.column_names:
+        logger.info("Dataset already has negated_prompt column")
+        return dataset
+
+    logger.info("Adding negated_prompt column to dataset")
+
+    # Function to generate negated description for a single row
+    def add_negation(example):
+        example["negated_prompt"] = generate_negated_description(example["text_description"])
+        return example
+
+    # Apply the function to the entire dataset with progress bar
+    dataset = dataset.map(
+        add_negation,
+        desc="Generating negated prompts",
+        num_proc=1  # Set higher for parallel processing if your system allows
+    )
+
+    # Save the updated dataset
+    dataset.save_to_disk("dataset_with_negations")
+
+    return dataset
+
 
 # Min-max normalization for loss computation
 def min_max_normalize(tensor):
@@ -319,9 +346,10 @@ def main():
     dataset = dataset.rename_column("description", "text_description").remove_columns(["segment_id"])
 
     # Filter down to a max number of samples (if needed)
-    max_samples = 50000
+    max_samples = 5000
     if max_samples < len(dataset):
         dataset = dataset.select(range(max_samples))
+    dataset = process_dataset_with_negated_prompts(dataset)
 
     # Split into train and validation (e.g., 90/10 split)
     split_dataset = dataset.train_test_split(test_size=0.1, seed=42)  # 10% for validation
