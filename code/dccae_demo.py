@@ -24,6 +24,8 @@ if 'search_type' not in st.session_state:
     st.session_state.search_type = "text"
 if 'num_results' not in st.session_state:
     st.session_state.num_results = 5
+if 'precomputed_embeddings' not in st.session_state:
+    st.session_state.precomputed_embeddings = None
 
 # Set the audio cache directory
 AUDIO_CACHE_DIR = "./audio_cache"
@@ -156,15 +158,62 @@ def cosine_similarity(emb1, emb2):
     return sim.mean().item()
 
 
+# Note the underscore prefix to prevent Streamlit from trying to hash the dataset
+def precompute_voice_embeddings(_dataset, model, device):
+    """
+    Precompute voice embeddings for all samples in the dataset
+    Returns the precomputed embeddings
+    """
+    logger.info("Precomputing voice embeddings for all samples...")
+
+    # Limit dataset size for demo/development
+    limited_dataset = _dataset['test'].select(range(10000))
+
+    # Store precomputed embeddings
+    precomputed_embeddings = []
+    total_samples = len(limited_dataset)
+
+    # Create progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for i, sample in enumerate(limited_dataset):
+        # Update progress bar
+        if i % 10 == 0:
+            progress = min(i / total_samples, 1.0)
+            progress_bar.progress(progress)
+            status_text.text(f"Processing sample {i}/{total_samples} ({progress * 100:.1f}%)")
+
+        # Extract audio embedding
+        audio_embedding = extract_audio_embedding(sample['audio'], model, device)
+
+        # Store embedding with sample info
+        if audio_embedding is not None:
+            precomputed_embeddings.append({
+                'index': i,
+                'description': sample['text_description'],
+                'audio': sample['audio'],
+                'embedding': audio_embedding
+            })
+
+    # Complete progress bar
+    progress_bar.progress(1.0)
+    status_text.text(f"✅ Precomputed {len(precomputed_embeddings)} voice embeddings")
+    logger.info(f"✅ Successfully precomputed {len(precomputed_embeddings)} voice embeddings")
+
+    return precomputed_embeddings
+
+
 def find_similar_voices():
     """
-    Find voices similar to the query (text or audio)
+    Find voices similar to the query (text or audio) using precomputed embeddings
     """
     # Reset results when new search is performed
     st.session_state.search_results = None
 
     search_type = st.session_state.search_type
     num_results = st.session_state.num_results
+    precomputed_embeddings = st.session_state.precomputed_embeddings
 
     # Get query embedding based on search type
     query_embedding = None
@@ -178,30 +227,20 @@ def find_similar_voices():
         st.error("Please provide a valid text query or upload an audio file")
         return
 
-    # Process all samples in the dataset
+    if precomputed_embeddings is None or len(precomputed_embeddings) == 0:
+        st.error("No precomputed embeddings available. Please try reloading the application.")
+        return
+
+    # Use precomputed embeddings to find similar voices
     results = []
-    progress_bar = st.progress(0)
-
-    limited_dataset = dataset['test'].select(range(100))  # Only first 100 samples
-    for i, sample in enumerate(limited_dataset):
-        # Update progress bar every 10 samples
-        if i % 10 == 0:
-            progress_bar.progress(min(i / min(len(dataset['test']), 100), 1.0))
-
-        # Get audio embedding for this sample
-        audio_embedding = extract_audio_embedding(sample['audio'], model, device)
-
-        if audio_embedding is not None:
-            similarity = cosine_similarity(query_embedding, audio_embedding)
-            results.append({
-                'index': i,
-                'description': sample['text_description'],
-                'similarity': similarity,
-                'audio': sample['audio']
-            })
-
-    # Complete the progress bar
-    progress_bar.progress(1.0)
+    for item in precomputed_embeddings:
+        similarity = cosine_similarity(query_embedding, item['embedding'])
+        results.append({
+            'index': item['index'],
+            'description': item['description'],
+            'similarity': similarity,
+            'audio': item['audio']
+        })
 
     # Sort results by similarity (highest first)
     results.sort(key=lambda x: x['similarity'], reverse=True)
@@ -220,6 +259,12 @@ dataset = load_cotts_dataset()
 if dataset is None:
     st.error("Failed to load dataset. Please check your dataset path.")
 else:
+    # Precompute voice embeddings for the dataset if not already done
+    if st.session_state.precomputed_embeddings is None:
+        with st.spinner("Precomputing voice embeddings... This may take a few minutes."):
+            st.session_state.precomputed_embeddings = precompute_voice_embeddings(dataset, model, device)
+        st.success(f"Successfully precomputed {len(st.session_state.precomputed_embeddings)} voice embeddings!")
+
     # Create tabs for different search methods
     search_tab, about_tab = st.tabs(["Search", "About"])
 

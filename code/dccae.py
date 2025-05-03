@@ -1,4 +1,3 @@
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,7 +18,7 @@ from cca_zoo.deep import architectures
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 16
 NUM_EPOCHS = 50
-LR = 1e-3
+LR = 1e-2
 TEXT_EMBED_DIM = 768
 AUDIO_EMBED_DIM = 256  # VoiceEncoder outputs 256-dim embeddings
 SHARED_DIM = 128  # Dimension of the shared space
