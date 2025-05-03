@@ -8,7 +8,7 @@ from sentence_transformers import SentenceTransformer
 from resemblyzer import VoiceEncoder, wav_to_mel_spectrogram
 from tqdm import tqdm
 import numpy as np
-from cca_zoo.deep import DCCA, DCCAE
+from cca_zoo.deep import DCCAE
 from cca_zoo.deep import architectures
 
 
@@ -19,7 +19,7 @@ from cca_zoo.deep import architectures
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 16
 NUM_EPOCHS = 50
-LR = 1e-4
+LR = 1e-3
 TEXT_EMBED_DIM = 768
 AUDIO_EMBED_DIM = 256  # VoiceEncoder outputs 256-dim embeddings
 SHARED_DIM = 128  # Dimension of the shared space

@@ -182,11 +182,11 @@ def find_similar_voices():
     results = []
     progress_bar = st.progress(0)
 
-    limited_dataset = dataset['train'].select(range(100))  # Only first 100 samples
+    limited_dataset = dataset['test'].select(range(100))  # Only first 100 samples
     for i, sample in enumerate(limited_dataset):
         # Update progress bar every 10 samples
         if i % 10 == 0:
-            progress_bar.progress(min(i / min(len(dataset['train']), 100), 1.0))
+            progress_bar.progress(min(i / min(len(dataset['test']), 100), 1.0))
 
         # Get audio embedding for this sample
         audio_embedding = extract_audio_embedding(sample['audio'], model, device)
