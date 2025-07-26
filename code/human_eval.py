@@ -13,6 +13,8 @@ from datasets import load_from_disk, Audio
 from voice_to_embedding import Voice2Embedding
 from tempfile import NamedTemporaryFile
 import json
+import pickle
+from pathlib import Path
 
 # Initialize session state for human evaluation
 if 'precomputed_embeddings' not in st.session_state:
@@ -45,13 +47,69 @@ if 'correct_evaluations' not in st.session_state:
 if 'evaluation_complete' not in st.session_state:
     st.session_state.evaluation_complete = False
 
-# Set the audio cache directory
+# Set the audio cache directory and embeddings cache file
 AUDIO_CACHE_DIR = "./audio_cache"
+EMBEDDINGS_CACHE_FILE = "./embeddings_cache.pkl"
 os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s]: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def save_embeddings_to_cache(embeddings, cache_file=EMBEDDINGS_CACHE_FILE):
+    """Save precomputed embeddings to cache file"""
+    try:
+        logger.info(f"Saving {len(embeddings)} embeddings to cache file: {cache_file}")
+        with open(cache_file, 'wb') as f:
+            pickle.dump(embeddings, f)
+        logger.info("✅ Successfully saved embeddings to cache")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save embeddings to cache: {e}")
+        return False
+
+
+def load_embeddings_from_cache(cache_file=EMBEDDINGS_CACHE_FILE):
+    """Load precomputed embeddings from cache file"""
+    try:
+        if not os.path.exists(cache_file):
+            logger.info(f"Cache file not found: {cache_file}")
+            return None
+
+        logger.info(f"Loading embeddings from cache file: {cache_file}")
+        with open(cache_file, 'rb') as f:
+            embeddings = pickle.load(f)
+        logger.info(f"✅ Successfully loaded {len(embeddings)} embeddings from cache")
+        return embeddings
+    except Exception as e:
+        logger.error(f"Failed to load embeddings from cache: {e}")
+        return None
+
+
+def get_cache_info(cache_file=EMBEDDINGS_CACHE_FILE):
+    """Get information about the cache file"""
+    if not os.path.exists(cache_file):
+        return None
+
+    try:
+        stat = os.stat(cache_file)
+        size_mb = stat.st_size / (1024 * 1024)
+        modified_time = stat.st_mtime
+
+        # Try to get the number of embeddings without loading the full file
+        with open(cache_file, 'rb') as f:
+            embeddings = pickle.load(f)
+            count = len(embeddings) if embeddings else 0
+
+        return {
+            'size_mb': size_mb,
+            'modified_time': modified_time,
+            'count': count
+        }
+    except Exception as e:
+        logger.error(f"Error getting cache info: {e}")
+        return None
 
 
 @st.cache_resource
@@ -106,7 +164,8 @@ def load_audio_file(audio_data):
 
 @st.cache_resource
 def load_model():
-    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     dense_embedding_model = SentenceTransformer("ibm-granite/granite-embedding-125m-english")
     voice_encoder = VoiceEncoder(device=device)
     model = Voice2Embedding(voice_encoder, projection_dim=dense_embedding_model.get_sentence_embedding_dimension())
@@ -179,6 +238,10 @@ def precompute_voice_embeddings(_dataset, model, device):
     progress_bar.progress(1.0)
     status_text.text(f"✅ Precomputed {len(precomputed_embeddings)} voice embeddings")
     logger.info(f"✅ Successfully precomputed {len(precomputed_embeddings)} voice embeddings")
+
+    # Save to cache
+    save_embeddings_to_cache(precomputed_embeddings)
+
     return precomputed_embeddings
 
 
@@ -280,15 +343,49 @@ dataset = load_cotts_dataset()
 if dataset is None:
     st.error("Failed to load dataset. Please check your dataset path.")
 else:
-    # Precompute voice embeddings if not already done
+    # Display cache information
+    cache_info = get_cache_info()
+    if cache_info:
+        st.info(f"📁 Embeddings cache found: {cache_info['count']} embeddings ({cache_info['size_mb']:.1f} MB)")
+
+    # Try to load embeddings from cache first
     if st.session_state.precomputed_embeddings is None:
-        with st.spinner("Precomputing voice embeddings... This may take a few minutes."):
-            st.session_state.precomputed_embeddings = precompute_voice_embeddings(dataset, model, device)
-        st.success(f"Successfully precomputed {len(st.session_state.precomputed_embeddings)} voice embeddings!")
+        # Try loading from cache
+        cached_embeddings = load_embeddings_from_cache()
+
+        if cached_embeddings is not None:
+            st.session_state.precomputed_embeddings = cached_embeddings
+            st.success(f"✅ Loaded {len(cached_embeddings)} precomputed embeddings from cache!")
+        else:
+            # Need to compute embeddings
+            st.warning("No cached embeddings found. Computing embeddings...")
+
+            # Add option to clear cache or recompute
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🔄 Recompute Embeddings"):
+                    with st.spinner("Computing voice embeddings... This may take a few minutes."):
+                        st.session_state.precomputed_embeddings = precompute_voice_embeddings(dataset, model, device)
+                    st.success(
+                        f"Successfully computed and cached {len(st.session_state.precomputed_embeddings)} voice embeddings!")
+                    st.rerun()
+
+            with col2:
+                if st.button("🗑️ Clear Cache") and cache_info:
+                    try:
+                        os.remove(EMBEDDINGS_CACHE_FILE)
+                        st.success("Cache cleared successfully!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to clear cache: {e}")
+
+            if st.session_state.precomputed_embeddings is None:
+                st.info("Click 'Recompute Embeddings' to start the evaluation.")
+                st.stop()
 
     # Display current accuracy
     accuracy = (
-                st.session_state.correct_evaluations / st.session_state.total_evaluations * 100) if st.session_state.total_evaluations > 0 else 0
+            st.session_state.correct_evaluations / st.session_state.total_evaluations * 100) if st.session_state.total_evaluations > 0 else 0
     st.metric("Current Accuracy", f"{accuracy:.1f}%")
 
     # Progress indicator
@@ -347,7 +444,7 @@ else:
         st.success("🎉 Evaluation Complete!")
 
         final_accuracy = (
-                    st.session_state.correct_evaluations / st.session_state.total_evaluations * 100) if st.session_state.total_evaluations > 0 else 0
+                st.session_state.correct_evaluations / st.session_state.total_evaluations * 100) if st.session_state.total_evaluations > 0 else 0
 
         st.write(f"**Final Results:**")
         st.write(f"- Total Evaluations: {st.session_state.total_evaluations}")
