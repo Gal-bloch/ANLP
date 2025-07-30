@@ -11,6 +11,7 @@ import os
 import logging
 from datasets import load_from_disk, Audio
 from voice_to_embedding import Voice2Embedding
+from create_dataset import ENRICHED_DATASET_PATH, AUDIO_COLUMN, DESCRIPTION_COLUMN, DESCRIPTION_EMBEDDING_COLUMN
 
 # Initialize session state
 if 'selected_idx' not in st.session_state:
@@ -38,11 +39,8 @@ def load_cotts_dataset():
     """
     try:
         logger.info("Loading CoTTS dataset from disk")
-        dataset = load_from_disk("/Users/galbloch/Desktop/school/git/ANLP/datasets/CoTTS_dataset")
-        dataset = dataset.cast_column("audio", Audio())
-
-        # Rename + clean the same way as in training
-        dataset = dataset.rename_column("description", "text_description").remove_columns(["segment_id"])
+        dataset = load_from_disk(ENRICHED_DATASET_PATH)
+        dataset = dataset.cast_column(AUDIO_COLUMN, Audio())
 
         # Split into train and validation (same as in training)
         split_dataset = dataset.train_test_split(test_size=0.1, seed=42)
@@ -92,12 +90,12 @@ def load_audio_file(audio_data):
 
 @st.cache_resource
 def load_model():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     dense_embedding_model = SentenceTransformer("ibm-granite/granite-embedding-125m-english")
     voice_encoder = VoiceEncoder(device=device)
     model = Voice2Embedding(voice_encoder, projection_dim=dense_embedding_model.get_sentence_embedding_dimension())
     try:
-        checkpoint = torch.load("best_voice2embedding_model.pt", map_location=device)
+        checkpoint = torch.load("../models/best_voice2embedding_model.pt", map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         logger.info("Successfully loaded model weights")
     except Exception as e:
@@ -122,13 +120,6 @@ def extract_audio_embedding(audio_data, model, device):
         st.error(f"Error processing audio: {e}")
         return None
 
-
-def extract_text_embedding(text, text_model):
-    with torch.no_grad():
-        text_embedding = text_model.encode([text], convert_to_tensor=True).cpu().numpy()
-    return text_embedding
-
-
 def cosine_similarity(emb1, emb2):
     if emb1 is None or emb2 is None or emb1.shape[1] != emb2.shape[1]:
         return 0  # Return zero similarity for invalid inputs
@@ -151,7 +142,7 @@ def update_selected_idx():
 
     # Update the text input with the new sample's description
     selected_sample = sample_dataset[st.session_state.selected_idx]
-    st.session_state.text_input = selected_sample['text_description']
+    st.session_state.text_input = selected_sample[DESCRIPTION_COLUMN]
 
 
 def update_text_input():
@@ -166,8 +157,8 @@ def compare_voice_to_text():
     text_input = st.session_state.text_input
 
     # Extract embeddings
-    audio_embedding = extract_audio_embedding(selected_sample['audio'], model, device)
-    text_embedding = extract_text_embedding(text_input, text_model)
+    audio_embedding = extract_audio_embedding(selected_sample[AUDIO_COLUMN], model, device)
+    text_embedding = selected_sample[DESCRIPTION_EMBEDDING_COLUMN]
 
     if audio_embedding is not None and text_embedding is not None:
         # Calculate similarity
@@ -198,7 +189,7 @@ else:
     sample_dataset = dataset['train'].select(sample_indices)
 
     # Create display options with indices
-    audio_options = {f"Sample {i + 1} - {sample['text_description'][:50]}...": i
+    audio_options = {f"Sample {i + 1} - {sample[DESCRIPTION_COLUMN][:50]}...": i
                      for i, sample in enumerate(sample_dataset)}
 
     # Use on_change callback to update session state without form submission
@@ -220,7 +211,7 @@ else:
     st.write(f"**Speaker description:** {selected_sample['text_description']}")
 
     # Process and display audio
-    wav, sample_rate = load_audio_file(selected_sample['audio'])
+    wav, sample_rate = load_audio_file(selected_sample[AUDIO_COLUMN])
     if len(wav) > 0:
         # For streamed data, create a temporary file
         temp_path = os.path.join(AUDIO_CACHE_DIR, f"temp_audio_{st.session_state.selected_idx}.wav")
@@ -232,8 +223,8 @@ else:
     # Create a form to prevent auto-submission on Enter key
     with st.form(key="text_comparison_form"):
         # Get user input with the current sample's description as default
-        if not st.session_state.text_input and selected_sample['text_description']:
-            st.session_state.text_input = selected_sample['text_description']
+        if not st.session_state.text_input and selected_sample[DESCRIPTION_COLUMN]:
+            st.session_state.text_input = selected_sample[DESCRIPTION_COLUMN]
 
         st.text_area("Enter a description of the voice",
                      key="text_input",
