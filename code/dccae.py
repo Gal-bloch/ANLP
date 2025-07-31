@@ -18,7 +18,7 @@ LR = 1e-2
 TEXT_EMBED_DIM = 768
 AUDIO_EMBED_DIM = 256  # VoiceEncoder outputs 256-dim embeddings
 SHARED_DIM = 128  # Dimension of the shared space
-AUDIO_PATH = "/Users/galbloch/Desktop/school/git/ANLP/datasets/dataset_with_negations"
+AUDIO_PATH = "../datasets/dataset_with_negations"
 
 
 # ========== DATASET ==========
