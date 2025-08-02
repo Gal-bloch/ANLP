@@ -1,20 +1,26 @@
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, random_split
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 from datasets import load_from_disk, Audio
-from create_dataset import ENRICHED_DATASET_PATH, SPEAKER_EMBEDDING_COLUMN, DESCRIPTION_EMBEDDING_COLUMN, NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN, GENDER_COLUMN, PITCH_COLUMN
+from create_dataset import ENRICHED_DATASET_PATH, RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN, GRANITE_DESCRIPTION_EMBEDDING_COLUMN, GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN
+from create_dataset import GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLUMN, SPEED_COLUMN, ENERGY_COLUMN
 import os
-from dccae import create_dccae_model
+from DCCA import create_dcca_model, DCCA_MODEL_PATH
+from Voice2Embedding import Voice2Embedding, VOICE2EMBEDDING_MODEL_PATH
+
 
 # Constants
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 32
 NUM_EPOCHS = 50
 LEARNING_RATE = 1e-3
-HIDDEN_DIM = 128
-EARLY_STOPPING_PATIENCE = 5
+
+DCCA_INPUT_DIM = 128
+VOICE2EMBEDDING_INPUT_DIM = 768
+
+MODEL_TYPES = ["dcca", "voice2embedding"]
+CLASS_TYPES = [GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLUMN, SPEED_COLUMN, ENERGY_COLUMN]
 
 class FeatureClassificationDataset(Dataset):
     """Dataset wrapper for gender classification task."""
@@ -60,17 +66,20 @@ def collate_fn(batch):
     """
     Custom collate function to handle variable-length audio and text embeddings.
     """
-    audio_embeddings = torch.tensor([item[SPEAKER_EMBEDDING_COLUMN] for item in batch])
-    description_embeddings = torch.tensor([item[DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
-    neg_description_embeddings = torch.tensor([item[NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
+    audio_embeddings = torch.tensor([item[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN] for item in batch])
+    description_embeddings = torch.tensor([item[GRANITE_DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
+    neg_description_embeddings = torch.tensor([item[GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
 
 
 
     return audio_embeddings, description_embeddings, neg_description_embeddings
 
 
-def evaluate_encodings(embeddings, labels, class_size, embedding_type, evaluation_type, experiment_type):
+def evaluate_encodings(embeddings, labels, class_size, embedding_type, evaluation_type, experiment_type, model_type="dcca"):
     """Evaluate a specific type of encoding (text or speech) for gender classification."""
+    if model_type not in MODEL_TYPES:
+        raise ValueError(f"Invalid model type: {model_type}. Choose from {MODEL_TYPES}")
+
     # Create dataset
     dataset = FeatureClassificationDataset(embeddings, labels)
 
@@ -88,7 +97,8 @@ def evaluate_encodings(embeddings, labels, class_size, embedding_type, evaluatio
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
 
     # Initialize model and training components
-    model = SpeechFeatureClassifier(output_dim=class_size).to(DEVICE)
+    model = SpeechFeatureClassifier(input_dim=DCCA_INPUT_DIM if model_type == "dcca" else VOICE2EMBEDDING_INPUT_DIM
+                                    , output_dim=class_size).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
@@ -129,176 +139,115 @@ def evaluate_encodings(embeddings, labels, class_size, embedding_type, evaluatio
             # Save the best mode
             best_val_acc = avg_val_acc
             torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
-             "val_acc": best_val_acc}, f"../models/Evaluation_Classifiers/{experiment_type}_{embedding_type}_embedding_classifier_{evaluation_type}_labels.pt")
+             "val_acc": best_val_acc}, f"../models/Evaluation_Classifiers/{model_type}_{experiment_type}_{embedding_type}_embedding_classifier_{evaluation_type}_labels.pt")
             print("New best model saved!")
 
         print(f"Epoch {epoch + 1} - Train Loss: {avg_train_loss:.4f}, Val Loss: {best_val_acc:.4f}")
 
-    model_data = torch.load(f"../models/Evaluation_Classifiers/{experiment_type}_{embedding_type}_embedding_classifier_{evaluation_type}_labels.pt")
+    model_data = torch.load(f"../models/Evaluation_Classifiers/{model_type}_{experiment_type}_{embedding_type}_embedding_classifier_{evaluation_type}_labels.pt")
     model_data["training_losses"] = training_losses
     model_data["validation_accuracies"] = validation_accuracies
-    torch.save(model_data, f"../models/Evaluation_Classifiers/{experiment_type}_{embedding_type}_embedding_classifier_{evaluation_type}_labels.pt")
+    torch.save(model_data, f"../models/Evaluation_Classifiers/{model_type}_{experiment_type}_{embedding_type}_embedding_classifier_{evaluation_type}_labels.pt")
 
     return best_val_acc
 
-def run_gender_test():
-    """Main evaluation pipeline."""
-    print("#### RUNNING GENDER TEST ####")
-    print("Loading dataset...")
-    dataset = load_from_disk(ENRICHED_DATASET_PATH)
-    dataset = dataset.cast_column("audio", Audio())
-    
-    # Load the trained DCCAE model
-    model_state_dict = torch.load("../models/dccae_voice_text_best.pt", map_location=DEVICE)["model_state_dict"]
-    model = create_dccae_model(state_dict=model_state_dict)
+def process_example(example, speech_encoder, description_encoder, class_title, class_labels):
+    try:
+        # Convert audio to numpy array and preprocess
+        description_embedding = example[GRANITE_DESCRIPTION_EMBEDDING_COLUMN]
+        speech_embedding = example[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN]
 
-    
-    model_description_embeddings = []
-    model_speech_embeddings = []
-    gender_labels = []
-    
-    def process_item(example):
-        """Process a single dataset item."""
-        try:
-            # Convert audio to numpy array and preprocess
-            description_embedding = example[DESCRIPTION_EMBEDDING_COLUMN]
-            speech_embedding = example[SPEAKER_EMBEDDING_COLUMN]
-            
-            # Get embeddings
-            with torch.no_grad():
-                model_speech_embedding = model.encoders[0](torch.tensor(speech_embedding)).cpu().numpy()
-                model_description_embedding = model.encoders[1](torch.tensor(description_embedding)).cpu().numpy()
+        # Get embeddings
+        with torch.no_grad():
+            model_speech_embedding = speech_encoder(speech_embedding).cpu().numpy()
+            model_description_embedding = description_encoder(description_embedding).cpu().numpy()
 
-            # Get gender label
-            gender_label = 0 if example[GENDER_COLUMN] == "male" else 1
+        # Get gender label
+        class_label = 0
+        for i in range(len(class_labels)):
+            if example[class_title] == class_labels[i]:
+                class_label = i
+                break
+            if i == len(class_labels) - 1:
+                raise ValueError(f"Label {example[class_title]} not found in class labels {class_labels}")
 
-            return {
-                'model_description_embedding': model_description_embedding,
-                'model_speech_embedding': model_speech_embedding,
-                'gender_label': gender_label,
-                'success': True
-            }
+        return {
+            'model_description_embedding': model_description_embedding,
+            'model_speech_embedding': model_speech_embedding,
+            'class_label': class_label,
+            'success': True
+        }
 
-        except Exception as e:
-            print(f"Error processing item: {e}")
-            return {'success': False}
-    
-    print("Processing dataset...")
-    for example in tqdm(dataset):
-        result = process_item(example)
-        if result['success']:
-            model_description_embeddings.append(result['model_description_embedding'])
-            model_speech_embeddings.append(result['model_speech_embedding'])
-            gender_labels.append(result['gender_label'])
-    
-    text_embeddings = torch.tensor(model_description_embeddings).squeeze().to(DEVICE)
-    speech_embeddings = torch.tensor(model_speech_embeddings).squeeze().to(DEVICE)
-    gender_labels = torch.tensor(gender_labels).squeeze().long().to(DEVICE)
-    
-    # Create random baseline labels
-    random_labels = torch.tensor([torch.randint(0, 2, ()).item() for _ in range(len(gender_labels))]).long().to(DEVICE)
-    
-    # Evaluate text encodings
-    print("\n Evaluating on Correct Labels...")
-    print("\nEvaluating Text Encodings...")
-    text_accuracy = evaluate_encodings(text_embeddings, gender_labels, class_size=2, embedding_type="Text", evaluation_type="Correct", experiment_type="Gender")
-    
-    # Evaluate speech encodings
-    print("\nEvaluating Speech Encodings...")
-    speech_accuracy = evaluate_encodings(speech_embeddings, gender_labels, class_size=2, embedding_type="Speech", evaluation_type="Correct", experiment_type="Gender")
-    
-    # Evaluate random baseline
-    print("\nEvaluating Random Baseline...")
-    print("\nEvaluating Text Encodings with Random Labels...")
-    random_text_accuracy = evaluate_encodings(text_embeddings, random_labels, class_size=2, embedding_type="Text", evaluation_type="Random", experiment_type="Gender")
-
-    print("\nEvaluating Speech Encodings with Random Labels...")
-    random_speech_accuracy = evaluate_encodings(speech_embeddings, random_labels, class_size=2, embedding_type="Speech", evaluation_type="Random", experiment_type="Gender")
-    
-    # Print final results
-    print("\n=== Final Results ===")
-    print(f"Text Encoding Accuracy: {text_accuracy:.4f}")
-    print(f"Speech Encoding Accuracy: {speech_accuracy:.4f}")
-    print(f"Random Labels Text Encoding Accuracy: {random_text_accuracy:.4f}")
-    print(f"Random Labels Speech Encoding Accuracy: {random_speech_accuracy:.4f}")
+    except Exception as e:
+        print(f"Error processing item: {e}")
+        return {'success': False}
 
 
+def run_test(class_title, class_labels, model_type):
 
-def run_pitch_test():
-    print("#### RUNNING PITCH TEST ####")
+    if model_type not in MODEL_TYPES:
+        raise ValueError(f"Invalid model type: {model_type}. Choose from {MODEL_TYPES}")
+    if class_title not in CLASS_TYPES:
+        raise ValueError(f"Invalid class title: {class_title}. Choose from {CLASS_TYPES}")
+
+    print(f"#### RUNNING {class_title.upper()} TEST WITH {model_type.upper()} MODEL ####")
     print("Loading dataset...")
     dataset = load_from_disk(ENRICHED_DATASET_PATH)
     dataset = dataset.cast_column("audio", Audio())
 
-    # Load the trained DCCAE model
-    model_state_dict = torch.load("../models/dccae_voice_text_best.pt", map_location=DEVICE)["model_state_dict"]
-    model = create_dccae_model(state_dict=model_state_dict)
+    if model_type == "dcca":
+        # Load the trained DCCAE model
+        model_state_dict = torch.load(DCCA_MODEL_PATH, map_location=DEVICE)["model_state_dict"]
+        model = create_dcca_model(state_dict=model_state_dict)
+        speech_encoder = model.encoders[0]
+        description_encoder = model.encoders[1]
+
+    else:
+        model_state_dict = torch.load(VOICE2EMBEDDING_MODEL_PATH, map_location=DEVICE)["model_state_dict"]
+        model = Voice2Embedding().load_state_dict(model_state_dict)
+        speech_encoder = model.encode_speech
+        description_encoder = lambda x: x
 
     model_description_embeddings = []
     model_speech_embeddings = []
-    pitch_labels = []
+    dataset_class_labels = []
 
-    def process_item(example):
-        """Process a single dataset item."""
-        try:
-            # Convert audio to numpy array and preprocess
-            description_embedding = example[DESCRIPTION_EMBEDDING_COLUMN]
-            speech_embedding = example[SPEAKER_EMBEDDING_COLUMN]
-
-            # Get embeddings
-            with torch.no_grad():
-                model_speech_embedding = model.encoders[0](torch.tensor(speech_embedding)).cpu().numpy()
-                model_description_embedding = model.encoders[1](torch.tensor(description_embedding)).cpu().numpy()
-
-            # Get gender label
-            gender_label = 0 if example[PITCH_COLUMN] == "low" else 1 if example[PITCH_COLUMN] == "normal" else 2
-
-            return {
-                'model_description_embedding': model_description_embedding,
-                'model_speech_embedding': model_speech_embedding,
-                'pitch_label': gender_label,
-                'success': True
-            }
-
-        except Exception as e:
-            print(f"Error processing item: {e}")
-            return {'success': False}
 
     print("Processing dataset...")
     for example in tqdm(dataset):
-        result = process_item(example)
+        result = process_example(example, speech_encoder, description_encoder, class_title, class_labels)
         if result['success']:
             model_description_embeddings.append(result['model_description_embedding'])
             model_speech_embeddings.append(result['model_speech_embedding'])
-            pitch_labels.append(result['pitch_label'])
+            dataset_class_labels.append(result['class_label'])
 
     text_embeddings = torch.tensor(model_description_embeddings).squeeze().to(DEVICE)
     speech_embeddings = torch.tensor(model_speech_embeddings).squeeze().to(DEVICE)
-    pitch_labels = torch.tensor(pitch_labels).squeeze().long().to(DEVICE)
+    dataset_class_labels = torch.tensor(dataset_class_labels).squeeze().long().to(DEVICE)
 
     # Create random baseline labels
-    random_labels = torch.tensor([torch.randint(0, 3, ()).item() for _ in range(len(pitch_labels))]).long().to(DEVICE)
+    random_labels = torch.tensor([torch.randint(0, len(class_labels), ()).item() for _ in range(len(dataset_class_labels))]).long().to(DEVICE)
 
     # Evaluate text encodings
     print("\n Evaluating on Correct Labels...")
     print("\nEvaluating Text Encodings...")
-    text_accuracy = evaluate_encodings(text_embeddings, pitch_labels, class_size=3, embedding_type="Text", evaluation_type="Correct",
-                                       experiment_type="Pitch")
+    text_accuracy = evaluate_encodings(text_embeddings, dataset_class_labels, class_size=len(class_labels), embedding_type="Text",
+                                       evaluation_type="Correct", experiment_type=class_title.upper(), model_type=model_type)
 
     # Evaluate speech encodings
     print("\nEvaluating Speech Encodings...")
-    speech_accuracy = evaluate_encodings(speech_embeddings, pitch_labels, class_size=3, embedding_type="Speech",
-                                         evaluation_type="Correct", experiment_type="Pitch")
+    speech_accuracy = evaluate_encodings(speech_embeddings, dataset_class_labels, class_size=len(class_labels), embedding_type="Speech",
+                                         evaluation_type="Correct", experiment_type=class_title.upper(), model_type=model_type)
 
     # Evaluate random baseline
     print("\nEvaluating Random Baseline...")
     print("\nEvaluating Text Encodings with Random Labels...")
-    random_text_accuracy = evaluate_encodings(text_embeddings, random_labels, class_size=3, embedding_type="Text",
-                                              evaluation_type="Random", experiment_type="Pitch")
+    random_text_accuracy = evaluate_encodings(text_embeddings, random_labels, class_size=len(class_labels), embedding_type="Text",
+                                              evaluation_type="Random", experiment_type=class_title.upper(), model_type=model_type)
 
     print("\nEvaluating Speech Encodings with Random Labels...")
-    random_speech_accuracy = evaluate_encodings(speech_embeddings, random_labels, class_size=3, embedding_type="Speech",
-                                                evaluation_type="Random", experiment_type="Pitch")
+    random_speech_accuracy = evaluate_encodings(speech_embeddings, random_labels, class_size=len(class_labels), embedding_type="Speech",
+                                                evaluation_type="Random", experiment_type=class_title.upper(), model_type=model_type)
 
     # Print final results
     print("\n=== Final Results ===")
@@ -306,12 +255,8 @@ def run_pitch_test():
     print(f"Speech Encoding Accuracy: {speech_accuracy:.4f}")
     print(f"Random Labels Text Encoding Accuracy: {random_text_accuracy:.4f}")
     print(f"Random Labels Speech Encoding Accuracy: {random_speech_accuracy:.4f}")
-
-
-
-
-
 
 
 if __name__ == "__main__":
-    run_pitch_test()
+    run_test(GENDER_COLUMN, ["male", "female"], model_type="dcca")
+    run_test(GENDER_COLUMN, ["male", "female"], model_type="voice2embedding")

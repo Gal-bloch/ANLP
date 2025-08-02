@@ -10,8 +10,8 @@ import soundfile as sf
 import os
 import logging
 from datasets import load_from_disk, Audio
-from voice_to_embedding import Voice2Embedding
-from create_dataset import ENRICHED_DATASET_PATH, AUDIO_COLUMN, DESCRIPTION_COLUMN, DESCRIPTION_EMBEDDING_COLUMN
+from Voice2Embedding import Voice2Embedding
+from create_dataset import ENRICHED_DATASET_PATH, AUDIO_COLUMN, DESCRIPTION_COLUMN, GRANITE_DESCRIPTION_EMBEDDING_COLUMN
 
 # Initialize session state
 if 'selected_idx' not in st.session_state:
@@ -158,7 +158,7 @@ def compare_voice_to_text():
 
     # Extract embeddings
     audio_embedding = extract_audio_embedding(selected_sample[AUDIO_COLUMN], model, device)
-    text_embedding = selected_sample[DESCRIPTION_EMBEDDING_COLUMN]
+    text_embedding = selected_sample[GRANITE_DESCRIPTION_EMBEDDING_COLUMN]
 
     if audio_embedding is not None and text_embedding is not None:
         # Calculate similarity

@@ -1,8 +1,6 @@
 import os
-
 # Ensure Python uses UTF-8 as default if possible
 os.environ["PYTHONUTF8"] = "1"
-
 
 # === Updated Monkey-patch builtins.open for read mode (non-binary) ===
 import builtins
@@ -41,10 +39,10 @@ GIGASPEECH_SPEECH_LABELS_DATASET_PATH = "../datasets/EN_labels_GIGASPEECH.csv"
 ID_COLUMN = "segment_id"
 DESCRIPTION_COLUMN = "text_description"
 NEGATIVE_DESCRIPTION_COLUMN = "negated_description"
-DESCRIPTION_EMBEDDING_COLUMN = "description_embedding"
-NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN = "negated_description_embedding"
+GRANITE_DESCRIPTION_EMBEDDING_COLUMN = "granite_description_embedding"
+GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN = "granite_negated_description_embedding"
 AUDIO_COLUMN = "audio"
-SPEAKER_EMBEDDING_COLUMN = "speaker_embedding"
+RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN = "resemblyzer_speaker_embedding"
 GENDER_COLUMN = "gender"
 AGE_COLUMN = "age"
 SPEED_COLUMN = "speed"
@@ -54,10 +52,11 @@ EMOTION_COLUMN = "emotion"
 
 COMBINED_DATASET_PATH = "../datasets/CoTTS_dataset"
 ENRICHED_DATASET_PATH = "../datasets/Enriched_CoTTS_dataset"
+ENRICHED_DATASET_V2_PATH = "../datasets/Enriched_CoTTS_dataset_v2"
 
 VALID_DATASET_SIZES = ["xs", "s", "m", "l", "xl"]
 
-HUGGINGFACE_TOKEN = "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"
+HUGGINGFACE_TOKEN = "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"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -71,6 +70,29 @@ speaker_encoder = VoiceEncoder(device=DEVICE)
 description_encoder = SentenceTransformer("ibm-granite/granite-embedding-125m-english")
 
 logger = logging.getLogger(__name__)
+
+REFINEMENT_PROMPT_TEMPLATE = """
+You will receive a voice description and a set of voice labels.
+Your task is to rewrite the description, removing any details that are not strictly related to the speaker's speech 
+attributes and the labels provided, while changing the description as little as possible.
+
+Do NOT add any new details or assumptions, and Don't leave ANY detail in the description that is not in the labels, or that is not about the speaker's speech attributes.
+Specifically, remove any detail that pertains to subject or field the speaker is speaking about, and focus ONLY on the speaker's speech attributes.
+Keep the style, structure, wording and tone of the original description, but limit the content strictly to the labeled attributes and the speaker's speech characteristics.
+
+Here are the labels:
+- Gender: {gender}
+- Age: {age}
+- Speaking speed: {speed}
+- Pitch: {pitch}
+- Energy: {energy}
+- Emotion: {emotion}
+
+Original description:
+"{original_description}"
+
+Output ONLY the new refined description — no numbering, no quotes, no explanations. Just the new description.
+"""
 
 
 def wav_to_mel_spectrogram_batch(wavs, sr=sampling_rate):
@@ -142,14 +164,14 @@ def extract_audio_embedding(audio):
         wav = np.mean(wav, axis=0)
 
     # Convert to mel spectrogram
-    mel_spec = wav_to_mel_spectrogram([wav])
-    mel_spec = mel_spec.to(DEVICE)
+    mel_spec = wav_to_mel_spectrogram(wav)
+    mel_spec = torch.tensor(mel_spec).unsqueeze(0).to(DEVICE)
 
     # Process the mel spectrogram through the encoder
     with torch.no_grad():
         audio_embedding = speaker_encoder(mel_spec).cpu().numpy()
 
-    return audio_embedding
+    return audio_embedding.squeeze(0)
 
 def extract_description_embeddings_batch(texts):
     """
@@ -238,6 +260,23 @@ def generate_negated_description(text):
     negated_prompt = ollama.generate(model="llama3.2", prompt=prompt).response
     logger.info("generated negated prompt: %s\n for original text: %s", negated_prompt, text)
     return negated_prompt
+
+
+
+
+
+def refine_description(description, gender, age, speed, pitch, energy, emotion):
+    prompt = REFINEMENT_PROMPT_TEMPLATE.format(
+        gender=gender,
+        age=age,
+        speed=speed,
+        pitch=pitch,
+        energy=energy,
+        emotion=emotion,
+        original_description=description)
+
+    response = ollama.generate(model="llama3.2", prompt=prompt).response.strip()
+    return response.strip('"')
 
 
 def create_dataset(dataset_size: str = "s"):
@@ -346,7 +385,7 @@ def create_dataset(dataset_size: str = "s"):
         return "EMPTY_PATH"
 
 
-def enrich_dataset(input_dataset_path = COMBINED_DATASET_PATH, output_dataset_path = ENRICHED_DATASET_PATH, batched=True, batch_size=16,
+def enrich_dataset(input_dataset_path = COMBINED_DATASET_PATH, output_dataset_path = ENRICHED_DATASET_PATH, batched=False, batch_size=16,
                    max_dataset_size = 10000):
     """
     Enrich the dataset with speaker embeddings and negated descriptions.
@@ -360,7 +399,7 @@ def enrich_dataset(input_dataset_path = COMBINED_DATASET_PATH, output_dataset_pa
         dataset = load_from_disk(input_dataset_path)
         print(f"Dataset at {input_dataset_path} loaded successfully.")
         if dataset.num_rows > max_dataset_size:
-            dataset = dataset.shuffle().select(range(max_dataset_size))
+            dataset = dataset.shuffle(seed=213).select(range(max_dataset_size))
     except Exception as e:
         print(f"Error loading the dataset from {input_dataset_path}: {e}")
         return "EMPTY_PATH"
@@ -377,10 +416,10 @@ def enrich_dataset(input_dataset_path = COMBINED_DATASET_PATH, output_dataset_pa
         negated_descriptions_embeddings = extract_description_embeddings_batch(negated_descriptions)
         
         # Update the examples with the new data
-        examples[SPEAKER_EMBEDDING_COLUMN] = speaker_embeddings
+        examples[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN] = speaker_embeddings
         examples[NEGATIVE_DESCRIPTION_COLUMN] = negated_descriptions
-        examples[DESCRIPTION_EMBEDDING_COLUMN] = descriptions_embeddings
-        examples[NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] = negated_descriptions_embeddings
+        examples[GRANITE_DESCRIPTION_EMBEDDING_COLUMN] = descriptions_embeddings
+        examples[GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] = negated_descriptions_embeddings
         
         return examples
 
@@ -396,14 +435,100 @@ def enrich_dataset(input_dataset_path = COMBINED_DATASET_PATH, output_dataset_pa
         negated_description_embedding = extract_description_embedding(negated_description)
 
         # Update the example with the new data
-        example[SPEAKER_EMBEDDING_COLUMN] = speaker_embedding
+        example[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN] = speaker_embedding
         example[NEGATIVE_DESCRIPTION_COLUMN] = negated_description
-        example[DESCRIPTION_EMBEDDING_COLUMN] = description_embedding
-        example[NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] = negated_description_embedding
+        example[GRANITE_DESCRIPTION_EMBEDDING_COLUMN] = description_embedding
+        example[GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] = negated_description_embedding
 
         return example
 
-    print("Enriching dataset in batches...")
+    print("Enriching dataset in batches..." if batched else "Enriching dataset one example at a time...")
+    enriched_dataset = dataset.map(
+        process_batch if batched else process_single,
+        batched=batched,
+        batch_size=batch_size,
+        desc="Processing batches" if batched else "Processing single examples",
+    )
+
+    # Save the enriched dataset
+    enriched_dataset.save_to_disk(output_dataset_path)
+    print(f"Enriched dataset saved to {output_dataset_path}.")
+
+
+def enrich_dataset_v2(input_dataset_path=COMBINED_DATASET_PATH, output_dataset_path=ENRICHED_DATASET_V2_PATH, batched=False, batch_size=16,
+                     max_dataset_size=10000):
+    """
+    Enrich the dataset with speaker embeddings and negated descriptions.
+    :param input_dataset_path: the path to the input dataset to enrich.
+    :param output_dataset_path: the path to save the enriched dataset.
+    :param batched: whether to process the dataset in batches.
+    :param batch_size: size of batches for processing.
+    :param max_dataset_size: maximum number of entries to process.
+    """
+
+    try:
+        dataset = load_from_disk(input_dataset_path)
+        print(f"Dataset at {input_dataset_path} loaded successfully.")
+        if dataset.num_rows > max_dataset_size:
+            dataset = dataset.shuffle(seed=213).select(range(max_dataset_size))
+    except Exception as e:
+        print(f"Error loading the dataset from {input_dataset_path}: {e}")
+        return "EMPTY_PATH"
+
+    def process_batch(examples):
+        # Generate speaker embeddings for the batch
+        audio_batch = examples[AUDIO_COLUMN]
+        speaker_embeddings = extract_audio_embeddings_batch(audio_batch)
+
+        # Generate negated descriptions for the batch and the descriptions embeddings
+        descriptions_batch = [refine_description(examples[DESCRIPTION_COLUMN][i],
+                                                 examples[GENDER_COLUMN][i],
+                                                    examples[AGE_COLUMN][i],
+                                                    examples[SPEED_COLUMN][i],
+                                                    examples[PITCH_COLUMN][i],
+                                                    examples[ENERGY_COLUMN][i],
+                                                    examples[EMOTION_COLUMN][i]) for i in range(len(examples))]
+        negated_descriptions = generate_negated_descriptions_batch(descriptions_batch)
+        descriptions_embeddings = extract_description_embeddings_batch(descriptions_batch)
+        negated_descriptions_embeddings = extract_description_embeddings_batch(negated_descriptions)
+
+        # Update the examples with the new data
+        examples[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN] = speaker_embeddings
+        examples[NEGATIVE_DESCRIPTION_COLUMN] = negated_descriptions
+        examples[GRANITE_DESCRIPTION_EMBEDDING_COLUMN] = descriptions_embeddings
+        examples[GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] = negated_descriptions_embeddings
+        examples[DESCRIPTION_COLUMN] = descriptions_batch
+
+        return examples
+
+    def process_single(example):
+        # Generate speaker embedding for a single example
+        audio = example[AUDIO_COLUMN]
+        speaker_embedding = extract_audio_embedding(audio)
+
+        # Generate negated description and its embedding
+        description = refine_description(example[DESCRIPTION_COLUMN],
+                                         example[GENDER_COLUMN],
+                                            example[AGE_COLUMN],
+                                            example[SPEED_COLUMN],
+                                            example[PITCH_COLUMN],
+                                            example[ENERGY_COLUMN],
+                                            example[EMOTION_COLUMN])
+
+        negated_description = generate_negated_description(description)
+        description_embedding = extract_description_embedding(description)
+        negated_description_embedding = extract_description_embedding(negated_description)
+
+        # Update the example with the new data
+        example[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN] = speaker_embedding
+        example[NEGATIVE_DESCRIPTION_COLUMN] = negated_description
+        example[GRANITE_DESCRIPTION_EMBEDDING_COLUMN] = description_embedding
+        example[GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] = negated_description_embedding
+        example[DESCRIPTION_COLUMN] = description
+
+        return example
+
+    print("Enriching dataset in batches..." if batched else "Enriching dataset in single examples...")
     enriched_dataset = dataset.map(
         process_batch if batched else process_single,
         batched=batched,
@@ -418,6 +543,10 @@ def enrich_dataset(input_dataset_path = COMBINED_DATASET_PATH, output_dataset_pa
 
 
 
+
+
+
 if __name__ == "__main__":
     # create_dataset(dataset_size='m')
-    enrich_dataset(batched=False)
+    enrich_dataset_v2(batched=False)
+
