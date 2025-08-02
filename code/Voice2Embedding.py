@@ -1,15 +1,14 @@
-from voice_to_embedding import Voice2Embedding
+import torch.nn as nn
 from sentence_transformers import SentenceTransformer
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from resemblyzer import VoiceEncoder, wav_to_mel_spectrogram
 import logging
 from datasets import load_from_disk, Audio
 from tqdm import tqdm
 import os
-from create_dataset import ENRICHED_DATASET_PATH, AUDIO_COLUMN, SPEAKER_EMBEDDING_COLUMN, DESCRIPTION_EMBEDDING_COLUMN, NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN
-
+from create_dataset import ENRICHED_DATASET_PATH, AUDIO_COLUMN, GRANITE_DESCRIPTION_EMBEDDING_COLUMN, GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN
+from Loss_Functions import contrastive_loss
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Set directory for downloaded audio
@@ -27,66 +26,101 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def cosine_similarity_loss(speech_emb, text_emb):
-    """Loss function that maximizes cosine similarity"""
-    return 1 - F.cosine_similarity(speech_emb, text_emb, dim=1).mean()
+
+# ========== CONFIG ==========
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+VOICE2EMBEDDING_VOICE_EMBEDDER = VoiceEncoder(device=DEVICE)
+VOICE2EMBEDDING_DESCRIPTION_EMBEDDER = SentenceTransformer("ibm-granite/granite-embedding-125m-english")
+
+BATCH_SIZE = 16
+NUM_EPOCHS = 50
+LR = 1e-3
+HEAD_NUM = 8
+LAYER_NUM = 3
+DROPOUT_RATE = 0.1
+TEXT_EMBED_DIM = 768
+AUDIO_EMBED_DIM = 256  # VoiceEncoder outputs 256-dim embeddings
+VOICE2EMBEDDING_MODEL_PATH = "../models/voice2embedding_model.pt"
 
 
-# Min-max normalization for loss computation
-def min_max_normalize(tensor):
-    """Apply min-max normalization to tensor values to range [0, 1]"""
-    min_val = torch.min(tensor)
-    max_val = torch.max(tensor)
-    if min_val == max_val:
-        return torch.zeros_like(tensor)
-    return (tensor - min_val) / (max_val - min_val)
 
 
-def contrastive_loss(speech_emb, text_emb, neg_text_emb, margin=0.5):
-    """
-    Contrastive loss using min-max normalization:
-    - Maximize similarity between speech and positive text
-    - Minimize similarity between speech and negative text
-    """
-    # Positive similarity (speech and matching text)
-    pos_sim = F.cosine_similarity(speech_emb, text_emb, dim=1)
+# ========== Model Definition ==========
 
-    # Negative similarity (speech and negated text)
-    neg_sim = F.cosine_similarity(speech_emb, neg_text_emb, dim=1)
+class Voice2Embedding(nn.Module):
+    def __init__(self, voice_encoder: nn.Module = VOICE2EMBEDDING_VOICE_EMBEDDER, projection_dim: int = TEXT_EMBED_DIM, nhead: int = HEAD_NUM, num_layers: int = LAYER_NUM,
+                 dropout: float = DROPOUT_RATE):
+        super().__init__()
+        self.base_model = voice_encoder
+        self.input_dim = voice_encoder.linear.out_features
 
-    # Normalize similarities
-    pos_sim_norm = min_max_normalize(pos_sim)
-    neg_sim_norm = min_max_normalize(neg_sim)
+        # Normal transformer without potentially unstable components
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.input_dim,
+            nhead=nhead,
+            dim_feedforward=4 * self.input_dim,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-    # Loss: minimize positive distance, maximize negative distance
-    loss = (1 - pos_sim_norm) + torch.clamp(neg_sim_norm - margin, min=0)
+        # Simple projection head to avoid instability
+        self.projection = nn.Sequential(
+            nn.Linear(self.input_dim, 2 * projection_dim),
+            nn.ReLU(),  # Back to ReLU for stability
+            nn.Dropout(dropout),
+            nn.Linear(2 * projection_dim, projection_dim)
+        )
 
-    return loss.mean()
+        # Gradient clipping in init to prevent explosion
+        for p in self.parameters():
+            if p.requires_grad:
+                p.register_hook(lambda grad: torch.clamp(grad, -1.0, 1.0))
 
-def info_nce_loss(speech_emb, text_emb, temperature=0.07):
-    """
-    InfoNCE loss with in-batch negatives (cross-modal)
-    speech_emb: (B, D)
-    text_emb: (B, D)
-    """
-    # Normalize
-    speech_emb = F.normalize(speech_emb, p=2, dim=1)
-    text_emb = F.normalize(text_emb, p=2, dim=1)
+        logger.info(f"Number of parameters in base model: {sum(p.numel() for p in self.base_model.parameters())}")
+        logger.info(f"Number of parameters in new model: {sum(p.numel() for p in self.parameters())}")
 
-    logits = torch.matmul(speech_emb, text_emb.T) / temperature  # (B, B)
-    labels = torch.arange(len(speech_emb)).to(speech_emb.device)  # Ground truth is the diagonal
+    def encode_speech(self, speech_embedding):
+        # Handle different input dimensions
+        if speech_embedding.dim() == 2:
+            speech_embedding = speech_embedding.unsqueeze(1)
 
-    loss_i2t = F.cross_entropy(logits, labels)       # Speech → Text
-    loss_t2i = F.cross_entropy(logits.T, labels)     # Text → Speech
+        # Add small epsilon to prevent zeros
+        speech_embedding = speech_embedding + 1e-8
 
-    return (loss_i2t + loss_t2i) / 2
+        # Apply transformer with stability check
+        encoded = self.transformer(speech_embedding)
 
+        # Simple mean pooling is more stable
+        pooled = encoded.mean(dim=1)
+
+        # Check for NaNs and replace if needed
+        if torch.isnan(pooled).any():
+            pooled = torch.where(torch.isnan(pooled), torch.ones_like(pooled) * 1e-8, pooled)
+
+        projected = self.projection(pooled)
+
+        # Softly normalize to avoid division by zero
+        norm = torch.norm(projected, p=2, dim=1, keepdim=True).clamp(min=1e-8)
+        normalized = projected / norm
+
+        return normalized
+
+    def forward(self, x):
+        with torch.no_grad():  # Don't backprop through base model initially
+            speech_embedding = self.base_model(x)
+
+        return self.encode_speech(speech_embedding)
+
+
+
+# ========== Training ==========
 
 def collate_fn(batch):
     """Custom collate function using pre-generated negated descriptions"""
     wavs = [item[AUDIO_COLUMN]["array"] for item in batch]
-    descriptions_embeddings = torch.tensor([item[DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
-    negated_descriptions_embeddings = torch.tensor([item[NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
+    descriptions_embeddings = torch.tensor([item[GRANITE_DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
+    negated_descriptions_embeddings = torch.tensor([item[GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
 
     mel_specs = [torch.tensor(wav_to_mel_spectrogram(wav)) for wav in wavs]
 
@@ -94,15 +128,9 @@ def collate_fn(batch):
 
 
 def main():
-    # logger.info("Merging datasets...")
-    # dataset = merge_datasets_with_audio()
-    #
-    # logger.info("Preparing training and validation datasets")
-    # train_dataset = MLSSpeakerDataset(dataset, 'train', max_samples=2500)
-    # val_dataset = MLSSpeakerDataset(dataset, 'dev', max_samples=50)
 
     dataset = load_from_disk(ENRICHED_DATASET_PATH)
-    dataset = dataset.cast_column("audio", Audio())
+    dataset = dataset.cast_column(AUDIO_COLUMN, Audio())
 
     # Split into train and validation (e.g., 90/10 split)
     split_dataset = dataset.train_test_split(test_size=0.1, seed=42)  # 10% for validation
@@ -126,6 +154,7 @@ def main():
     num_epochs = 50
     best_val_loss = float("inf")
 
+    train_losses, val_losses = [], []
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
@@ -143,8 +172,6 @@ def main():
             neg_desc_emb = neg_desc_emb.to(device)
 
             loss = contrastive_loss(speech_emb, desc_emb, neg_desc_emb)
-
-
 
             optimizer.zero_grad()
             loss.backward()
@@ -177,6 +204,9 @@ def main():
         avg_val_loss = val_loss / len(val_loader)
         scheduler.step(avg_val_loss)
 
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
+
         logger.info(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
 
         # Save best model
@@ -185,9 +215,16 @@ def main():
             torch.save(
                 {"epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
                  "val_loss": best_val_loss},
-                "../models/best_voice2embedding_model.pt",
+                VOICE2EMBEDDING_MODEL_PATH,
             )
             logger.info(f"Saved new best model with validation loss: {best_val_loss:.4f}")
+
+    model_data = torch.load(VOICE2EMBEDDING_MODEL_PATH)
+    model_data["training_losses"] = train_losses
+    model_data["validation_losses"] = val_losses
+    torch.save(model_data, VOICE2EMBEDDING_MODEL_PATH)
+
+    logger.info("Training complete. Best model saved.")
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ import soundfile as sf
 import os
 import logging
 from datasets import load_from_disk, Audio
-from voice_to_embedding import Voice2Embedding
+from Voice2Embedding import Voice2Embedding
 from tempfile import NamedTemporaryFile
 
 # Initialize session state
