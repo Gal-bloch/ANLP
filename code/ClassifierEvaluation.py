@@ -1,13 +1,15 @@
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
-from datasets import load_from_disk, Audio
-from create_dataset import ENRICHED_DATASET_PATH, RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN, GRANITE_DESCRIPTION_EMBEDDING_COLUMN, GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN
+from datasets import load_from_disk, Audio, concatenate_datasets
+from create_dataset import ENRICHED_DATASET_V2_PATH, RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN, GRANITE_DESCRIPTION_EMBEDDING_COLUMN
 from create_dataset import GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLUMN, SPEED_COLUMN, ENERGY_COLUMN
 import os
 from DCCA import create_dcca_model, DCCA_MODEL_PATH
 from Voice2Embedding import Voice2Embedding, VOICE2EMBEDDING_MODEL_PATH
+import glob
+import pandas as pd
 
 
 # Constants
@@ -19,7 +21,7 @@ LEARNING_RATE = 1e-3
 DCCA_INPUT_DIM = 128
 VOICE2EMBEDDING_INPUT_DIM = 768
 
-MODEL_TYPES = ["dcca", "voice2embedding"]
+MODEL_TYPES = ["dcca", "voice2embedding", "baseline"]
 CLASS_TYPES = [GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLUMN, SPEED_COLUMN, ENERGY_COLUMN]
 
 class FeatureClassificationDataset(Dataset):
@@ -62,17 +64,6 @@ class SpeechFeatureClassifier(nn.Module):
         with torch.no_grad():
             return torch.argmax(self.forward(x), dim=1)
 
-def collate_fn(batch):
-    """
-    Custom collate function to handle variable-length audio and text embeddings.
-    """
-    audio_embeddings = torch.tensor([item[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN] for item in batch])
-    description_embeddings = torch.tensor([item[GRANITE_DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
-    neg_description_embeddings = torch.tensor([item[GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
-
-
-
-    return audio_embeddings, description_embeddings, neg_description_embeddings
 
 
 def evaluate_encodings(embeddings, labels, class_size, embedding_type, evaluation_type, experiment_type, model_type="dcca"):
@@ -83,22 +74,19 @@ def evaluate_encodings(embeddings, labels, class_size, embedding_type, evaluatio
     # Create dataset
     dataset = FeatureClassificationDataset(embeddings, labels)
 
-    # Split dataset
-    total_size = len(dataset)
-    train_size = int(0.9 * total_size)
-    test_size = total_size - train_size
-
-    train_dataset, test_dataset = random_split(
-        dataset, [train_size, test_size]
-    )
+    train_dataset = Subset(dataset, list(range(int(0.9 * len(dataset)))))
+    test_dataset = Subset(dataset, list(range(int(0.9 * len(dataset)), len(dataset))))
 
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     # Initialize model and training components
-    model = SpeechFeatureClassifier(input_dim=DCCA_INPUT_DIM if model_type == "dcca" else VOICE2EMBEDDING_INPUT_DIM
-                                    , output_dim=class_size).to(DEVICE)
+    model = SpeechFeatureClassifier(input_dim=embeddings.shape[1],
+
+
+
+                                    output_dim=class_size).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
@@ -106,7 +94,8 @@ def evaluate_encodings(embeddings, labels, class_size, embedding_type, evaluatio
     best_val_acc = 0.0
     os.makedirs("../models/Evaluation_Classifiers", exist_ok=True)
 
-    for epoch in range(NUM_EPOCHS):
+    for epoch in tqdm(range(NUM_EPOCHS), desc=f"Training {embedding_type} embeddings for {experiment_type} - {model_type} model",
+                        unit="epoch"):
         # Training phase
         model.train()
         total_train_loss = 0
@@ -140,9 +129,6 @@ def evaluate_encodings(embeddings, labels, class_size, embedding_type, evaluatio
             best_val_acc = avg_val_acc
             torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
              "val_acc": best_val_acc}, f"../models/Evaluation_Classifiers/{model_type}_{experiment_type}_{embedding_type}_embedding_classifier_{evaluation_type}_labels.pt")
-            print("New best model saved!")
-
-        print(f"Epoch {epoch + 1} - Train Loss: {avg_train_loss:.4f}, Val Loss: {best_val_acc:.4f}")
 
     model_data = torch.load(f"../models/Evaluation_Classifiers/{model_type}_{experiment_type}_{embedding_type}_embedding_classifier_{evaluation_type}_labels.pt")
     model_data["training_losses"] = training_losses
@@ -154,8 +140,8 @@ def evaluate_encodings(embeddings, labels, class_size, embedding_type, evaluatio
 def process_example(example, speech_encoder, description_encoder, class_title, class_labels):
     try:
         # Convert audio to numpy array and preprocess
-        description_embedding = example[GRANITE_DESCRIPTION_EMBEDDING_COLUMN]
-        speech_embedding = example[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN]
+        description_embedding = torch.tensor(example[GRANITE_DESCRIPTION_EMBEDDING_COLUMN]).squeeze().to(DEVICE)
+        speech_embedding = torch.tensor(example[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN]).squeeze().to(DEVICE)
 
         # Get embeddings
         with torch.no_grad():
@@ -183,7 +169,7 @@ def process_example(example, speech_encoder, description_encoder, class_title, c
         return {'success': False}
 
 
-def run_test(class_title, class_labels, model_type):
+def run_test(class_title, model_type):
 
     if model_type not in MODEL_TYPES:
         raise ValueError(f"Invalid model type: {model_type}. Choose from {MODEL_TYPES}")
@@ -192,21 +178,28 @@ def run_test(class_title, class_labels, model_type):
 
     print(f"#### RUNNING {class_title.upper()} TEST WITH {model_type.upper()} MODEL ####")
     print("Loading dataset...")
-    dataset = load_from_disk(ENRICHED_DATASET_PATH)
+    dataset_dict = load_from_disk(ENRICHED_DATASET_V2_PATH)
+    dataset = concatenate_datasets([dataset_dict["train"], dataset_dict["test"]])
     dataset = dataset.cast_column("audio", Audio())
+    class_labels = list(set(dataset[class_title]))
 
     if model_type == "dcca":
         # Load the trained DCCAE model
         model_state_dict = torch.load(DCCA_MODEL_PATH, map_location=DEVICE)["model_state_dict"]
         model = create_dcca_model(state_dict=model_state_dict)
-        speech_encoder = model.encoders[0]
-        description_encoder = model.encoders[1]
+        speech_encoder = model.encode_speech
+        description_encoder = model.encode_text
 
-    else:
+    elif model_type == "voice2embedding":
         model_state_dict = torch.load(VOICE2EMBEDDING_MODEL_PATH, map_location=DEVICE)["model_state_dict"]
-        model = Voice2Embedding().load_state_dict(model_state_dict)
+        model = Voice2Embedding()
+        model.load_state_dict(model_state_dict)
         speech_encoder = model.encode_speech
         description_encoder = lambda x: x
+
+    else:
+        speech_encoder = lambda x : x
+        description_encoder = lambda x : x
 
     model_description_embeddings = []
     model_speech_embeddings = []
@@ -257,6 +250,65 @@ def run_test(class_title, class_labels, model_type):
     print(f"Random Labels Speech Encoding Accuracy: {random_speech_accuracy:.4f}")
 
 
+def run_experiments():
+    # Run all tests
+    for class_title in CLASS_TYPES:
+        for model_type in MODEL_TYPES:
+            run_test(class_title, model_type)
+
+
+# Summarize results
+def summarize_results():
+
+
+    # Define paths and constants
+    checkpoint_dir = r"../models/Evaluation_Classifiers/"
+    test_types = [GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLUMN, SPEED_COLUMN, ENERGY_COLUMN]
+    model_types = ["dcca", "voice2embedding", "baseline"]
+    modalities = ["Text", "Speech"]
+    label_types = ["Correct", "Random"]
+
+    # Initialize results dictionary
+    results = []
+
+    # Extract best accuracies
+    for test_type in test_types:
+        for model_type in model_types:
+            for modality in modalities:
+                for label_type in label_types:
+                    file = rf"{checkpoint_dir}{model_type}_{test_type.upper()}_{modality}_embedding_classifier_{label_type}_labels.pt"
+                    checkpoint = torch.load(file, map_location=DEVICE)
+                    best_acc = checkpoint.get("val_acc", 0)
+                    results.append({
+                        "Test Type": test_type,
+                        "Model Type": model_type,
+                        "Modality": modality,
+                        "Label Type": label_type,
+                        "Best Accuracy": best_acc
+                    })
+
+    # Reduce redundancy for Text modality in Voice2Embedding and Baseline
+    reduced_results = [
+        result for result in results
+        if not (result["Modality"] == "Text" and result["Model Type"] == "voice2embedding")
+    ]
+
+    # Check if reduced_results is not empty
+    if reduced_results:
+        # Convert reduced results to DataFrame
+        df = pd.DataFrame(reduced_results)
+
+        # Write all accumulated data to text file
+        output_file = "../results/results_summary.txt"
+        with open(output_file, "w") as f:
+            f.write(df.to_string(index=False))
+
+        print(f"Results summary written to {output_file}")
+    else:
+        print("No results to summarize. The reduced_results list is empty.")
+
+
 if __name__ == "__main__":
-    run_test(GENDER_COLUMN, ["male", "female"], model_type="dcca")
-    run_test(GENDER_COLUMN, ["male", "female"], model_type="voice2embedding")
+    # run_experiments()
+    summarize_results()
+    print("All tests completed.")
