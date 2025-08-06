@@ -29,7 +29,7 @@ builtins.open = patched_open
 
 # --------------------------------------------------
 import pandas as pd
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, DatasetDict
 from huggingface_hub import login
 import ollama
 
@@ -450,8 +450,13 @@ def enrich_dataset(input_dataset_path = COMBINED_DATASET_PATH, output_dataset_pa
         desc="Processing batches" if batched else "Processing single examples",
     )
 
+    split = enriched_dataset.train_test_split(test_size=0.1, seed=213)
+    train_dataset = split["train"]
+    test_dataset = split["test"]
+    full_enriched_dataset = DatasetDict({'train': train_dataset, 'test': test_dataset})
+
     # Save the enriched dataset
-    enriched_dataset.save_to_disk(output_dataset_path)
+    full_enriched_dataset.save_to_disk(output_dataset_path)
     print(f"Enriched dataset saved to {output_dataset_path}.")
 
 
@@ -536,17 +541,11 @@ def enrich_dataset_v2(input_dataset_path=COMBINED_DATASET_PATH, output_dataset_p
         desc="Processing batches" if batched else "Processing single examples",
     )
 
+    split = enriched_dataset.train_test_split(test_size=0.1, seed=213)
+    train_dataset = split["train"]
+    test_dataset = split["test"]
+    full_enriched_dataset = DatasetDict({"train": train_dataset, "test": test_dataset})
+
     # Save the enriched dataset
-    enriched_dataset.save_to_disk(output_dataset_path)
+    full_enriched_dataset.save_to_disk(output_dataset_path)
     print(f"Enriched dataset saved to {output_dataset_path}.")
-
-
-
-
-
-
-
-if __name__ == "__main__":
-    # create_dataset(dataset_size='m')
-    enrich_dataset_v2(batched=False)
-

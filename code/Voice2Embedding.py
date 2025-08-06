@@ -1,5 +1,6 @@
 import torch.nn as nn
 from sentence_transformers import SentenceTransformer
+import torch.nn.functional as F
 import torch
 from torch.utils.data import DataLoader
 from resemblyzer import VoiceEncoder, wav_to_mel_spectrogram
@@ -7,8 +8,7 @@ import logging
 from datasets import load_from_disk, Audio
 from tqdm import tqdm
 import os
-from create_dataset import ENRICHED_DATASET_PATH, AUDIO_COLUMN, GRANITE_DESCRIPTION_EMBEDDING_COLUMN, GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN
-from Loss_Functions import contrastive_loss
+from create_dataset import ENRICHED_DATASET_V2_PATH, AUDIO_COLUMN, GRANITE_DESCRIPTION_EMBEDDING_COLUMN, GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Set directory for downloaded audio
@@ -34,7 +34,8 @@ VOICE2EMBEDDING_DESCRIPTION_EMBEDDER = SentenceTransformer("ibm-granite/granite-
 
 BATCH_SIZE = 16
 NUM_EPOCHS = 50
-LR = 1e-3
+LR = 1e-5
+WEIGHT_DECAY = 1e-4
 HEAD_NUM = 8
 LAYER_NUM = 3
 DROPOUT_RATE = 0.1
@@ -80,16 +81,18 @@ class Voice2Embedding(nn.Module):
         logger.info(f"Number of parameters in base model: {sum(p.numel() for p in self.base_model.parameters())}")
         logger.info(f"Number of parameters in new model: {sum(p.numel() for p in self.parameters())}")
 
-    def encode_speech(self, speech_embedding):
+    def encode_speech(self, speech_embeddings):
         # Handle different input dimensions
-        if speech_embedding.dim() == 2:
-            speech_embedding = speech_embedding.unsqueeze(1)
+        if speech_embeddings.dim() == 1:
+            speech_embeddings = speech_embeddings.unsqueeze(0)
+        if speech_embeddings.dim() == 2:
+            speech_embeddings = speech_embeddings.unsqueeze(1)
 
         # Add small epsilon to prevent zeros
-        speech_embedding = speech_embedding + 1e-8
+        speech_embeddings = speech_embeddings + 1e-8
 
         # Apply transformer with stability check
-        encoded = self.transformer(speech_embedding)
+        encoded = self.transformer(speech_embeddings)
 
         # Simple mean pooling is more stable
         pooled = encoded.mean(dim=1)
@@ -106,11 +109,29 @@ class Voice2Embedding(nn.Module):
 
         return normalized
 
-    def forward(self, x):
+    def forward(self, speech_mel_spec):
         with torch.no_grad():  # Don't backprop through base model initially
-            speech_embedding = self.base_model(x)
+            speech_embedding = self.base_model(speech_mel_spec)
 
         return self.encode_speech(speech_embedding)
+
+    @staticmethod
+    def loss(speech_encoding, description_embedding):
+        return 1 - F.cosine_similarity(speech_encoding, description_embedding, dim=1).mean()
+
+    @staticmethod
+    def contrastive_loss(speech_encoding, positive_reference, negative_reference):
+        if type(negative_reference) == str:
+            negative_reference = VOICE2EMBEDDING_DESCRIPTION_EMBEDDER(negative_reference)
+        if type(positive_reference) == str:
+            positive_reference = VOICE2EMBEDDING_DESCRIPTION_EMBEDDER(positive_reference)
+
+        pos_distance = 1 - F.cosine_similarity(speech_encoding, positive_reference, dim=1)
+        neg_distance = 1 - F.cosine_similarity(speech_encoding, negative_reference, dim=1)
+
+        return (pos_distance - neg_distance).mean()
+
+
 
 
 
@@ -128,17 +149,12 @@ def collate_fn(batch):
 
 
 def main():
+    dataset_dict = load_from_disk(ENRICHED_DATASET_V2_PATH)
+    train_dataset = dataset_dict["train"].cast_column(AUDIO_COLUMN, Audio())
+    test_dataset = dataset_dict["test"].cast_column(AUDIO_COLUMN, Audio())
 
-    dataset = load_from_disk(ENRICHED_DATASET_PATH)
-    dataset = dataset.cast_column(AUDIO_COLUMN, Audio())
-
-    # Split into train and validation (e.g., 90/10 split)
-    split_dataset = dataset.train_test_split(test_size=0.1, seed=42)  # 10% for validation
-    train_dataset = split_dataset["train"]
-    val_dataset = split_dataset["test"]
-
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=collate_fn, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
 
     logger.info("Initializing model")
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
@@ -147,7 +163,7 @@ def main():
     model = Voice2Embedding(voice_encoder, projection_dim=dense_embedding_model.get_sentence_embedding_dimension())
     model.to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.3, patience=5)
 
     logger.info("Running training loop")
@@ -171,7 +187,7 @@ def main():
             desc_emb = desc_emb.to(device)
             neg_desc_emb = neg_desc_emb.to(device)
 
-            loss = contrastive_loss(speech_emb, desc_emb, neg_desc_emb)
+            loss = model.contrastive_loss(speech_emb, desc_emb, neg_desc_emb)
 
             optimizer.zero_grad()
             loss.backward()
@@ -198,7 +214,7 @@ def main():
                 desc_emb = desc_emb.to(device)
                 neg_desc_emb = neg_desc_emb.to(device)
 
-                loss = contrastive_loss(speech_emb, desc_emb, neg_desc_emb)
+                loss = model.contrastive_loss(speech_emb, desc_emb, neg_desc_emb)
                 val_loss += loss.item()
 
         avg_val_loss = val_loss / len(val_loader)

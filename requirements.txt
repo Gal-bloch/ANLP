@@ -31,7 +31,7 @@ coqpit==0.0.17
 cycler==0.12.1
 cymem==2.0.11
 Cython==3.0.12
-datasets==3.5.0
+datasets~=3.6.0
 dateparser==1.1.8
 decorator==5.2.1
 defusedxml==0.7.1
@@ -57,7 +57,7 @@ gruut_lang_en==2.0.1
 gruut_lang_es==2.0.1
 gruut_lang_fr==2.0.2
 hangul-romanize==0.1.0
-huggingface-hub==0.30.2
+huggingface-hub~=0.31.1
 idna==3.10
 inflect==7.5.0
 ipython==8.12.3
@@ -144,7 +144,7 @@ rpds-py==0.24.0
 safetensors==0.5.3
 scikit-learn==1.6.1
 scipy==1.15.2
-sentence-transformers~=4.1.0
+sentence-transformers~=5.0.0
 shellingham==1.5.4
 six==1.17.0
 smart-open==7.1.0
@@ -157,7 +157,7 @@ spacy-legacy==3.0.12
 spacy-loggers==1.0.5
 srsly==2.5.1
 stack-data==0.6.3
-streamlit==1.44.1
+streamlit~=1.47.0
 SudachiDict-core==20250129
 SudachiPy==0.6.10
 sympy==1.13.1
@@ -169,8 +169,8 @@ threadpoolctl==3.6.0
 tinycss2==1.4.0
 tokenizers==0.21.1
 toml==0.10.2
-torch==2.6.0
-torchaudio==2.6.0
+torch~=2.7.1
+torchaudio~=2.7.1
 tornado==6.4.2
 tqdm==4.67.1
 trainer==0.0.36
@@ -197,4 +197,5 @@ xxhash==3.5.0
 yarg==0.1.9
 yarl==1.19.0
 
-ollama~=0.4.8
+ollama~=0.5.1
+mvlearn~=0.5.0

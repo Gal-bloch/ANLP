@@ -1,14 +1,10 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.utils.tensorboard.summary
 from torch.utils.data import DataLoader
 from datasets import load_from_disk, Audio
 from tqdm import tqdm
-from cca_zoo.deep import DCCA, DCCA_EY
-from cca_zoo.deep import architectures
 from create_dataset import ENRICHED_DATASET_V2_PATH, AUDIO_COLUMN, RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN, GRANITE_DESCRIPTION_EMBEDDING_COLUMN, GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN
-from Loss_Functions import contrastive_loss
 from resemblyzer import VoiceEncoder
 from sentence_transformers import SentenceTransformer
 
@@ -21,8 +17,10 @@ DCCA_DESCRIPTION_EMBEDDER = SentenceTransformer("ibm-granite/granite-embedding-1
 
 BATCH_SIZE = 16
 NUM_EPOCHS = 50
-LR = 1e-3
+LR = 1e-5
 WEIGHT_DECAY = 1e-4
+DROPOUT_RATE = 0.1
+EPS = 1e-3
 TEXT_EMBED_DIM = 768
 AUDIO_EMBED_DIM = 256  # VoiceEncoder outputs 256-dim embeddings
 SHARED_DIM = 128  # Dimension of the shared space
@@ -32,104 +30,175 @@ DCCA_MODEL_PATH = "../models/dcca_voice_text.pt"
 
 # ========== Model Definition ==========
 
+class DCCASpeechText(nn.Module):
+    def __init__(self, audio_dim=AUDIO_EMBED_DIM, text_dim=TEXT_EMBED_DIM, shared_dim=SHARED_DIM,
+                 dropout_rate=DROPOUT_RATE,  # Dropout rate for regularization
+                 device=DEVICE):
+        super(DCCASpeechText, self).__init__()
+        self.device = device
+        self.shared_dim = shared_dim
+
+        self.audio_encoder = nn.Sequential(
+            nn.Linear(audio_dim, 8 * audio_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(8 * audio_dim, 4 * audio_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(4 * audio_dim, 2 * audio_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(2 * audio_dim, shared_dim)
+        )
+
+        self.text_encoder = nn.Sequential(
+            nn.Linear(text_dim, 8 * text_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(8 * text_dim, 4 * text_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(4 * text_dim, 2 * text_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(2 * text_dim, shared_dim)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def encode_speech(self, audio_emb):
+        x = audio_emb
+        for i, layer in enumerate(self.audio_encoder):
+            x = layer(x)
+            if not torch.isfinite(x).all():
+                print(f"❌ NaN after audio layer {i}: {layer}")
+                break
+        return x
+
+    def encode_text(self, text_emb):
+        x = text_emb
+        for i, layer in enumerate(self.text_encoder):
+            x = layer(x)
+            if not torch.isfinite(x).all():
+                print(f"❌ NaN after text layer {i}: {layer}")
+                break
+        return x
+
+    def forward(self, audio_emb, text_emb):
+        audio_encoding = self.encode_speech(audio_emb)
+        text_encoding = self.encode_text(text_emb)
+        return audio_encoding, text_encoding
+
+    @staticmethod
+    def correlation_loss(representations: list, eps=EPS):
+        """
+        representations: [z1, z2] from two encoders. Both tensors are [batch_size, latent_dim]
+        Returns: negative mean of canonical correlations
+        """
+        z1, z2 = representations
+        z1 = z1 - z1.mean(dim=0, keepdim=True)
+        z2 = z2 - z2.mean(dim=0, keepdim=True)
+
+        cov_z1 = z1.T @ z1 / (z1.size(0) - 1) + eps * torch.eye(z1.size(1), device=z1.device)
+        cov_z2 = z2.T @ z2 / (z2.size(0) - 1) + eps * torch.eye(z2.size(1), device=z2.device)
+        cross_cov = z1.T @ z2 / (z1.size(0) - 1)
+
+        sym_cross_cov = (cross_cov + cross_cov.T) / 2
+        eigvals = torch.linalg.eigh(torch.linalg.solve(cov_z1, sym_cross_cov) @ torch.linalg.solve(cov_z2, sym_cross_cov.T))[0]
+        canonical_corrs = torch.sqrt(torch.clamp(eigvals, min=0.0))
+        return -canonical_corrs.mean()
+
+    @staticmethod
+    def loss(audio_encoding, text_encoding):
+        return DCCASpeechText.correlation_loss([audio_encoding, text_encoding])
+
+    @staticmethod
+    def contrastive_loss(audio_encoding, text_encoding, neg_text_encoding):
+        pos_correlation_loss = DCCASpeechText.correlation_loss([audio_encoding, text_encoding])
+        neg_correlation_loss = DCCASpeechText.correlation_loss([audio_encoding, neg_text_encoding])
+        return pos_correlation_loss - neg_correlation_loss
+
+
 def create_dcca_model(audio_embedding_dim=AUDIO_EMBED_DIM, text_embedding_dim=TEXT_EMBED_DIM, shared_dim=SHARED_DIM,
                       device=DEVICE, state_dict=None):
-
-    audio_encoder = architectures.Encoder(latent_dimensions=shared_dim, feature_size=audio_embedding_dim,
-                                          layer_sizes=(8 * audio_embedding_dim, 4 * audio_embedding_dim, 2 * audio_embedding_dim),
-                                            activation=nn.ReLU(), dropout=0.1)
-    text_encoder = architectures.Encoder(latent_dimensions=shared_dim, feature_size=text_embedding_dim,
-                                        layer_sizes=(8 * text_embedding_dim, 4 * text_embedding_dim, 2 * text_embedding_dim),
-                                            activation=nn.ReLU(), dropout=0.1)
-
-    model = DCCA(
-        latent_dimensions=shared_dim,
-        encoders=[audio_encoder, text_encoder],
-        device=device
-    ).to(device)
-
+    model = DCCASpeechText(audio_dim=audio_embedding_dim, text_dim=text_embedding_dim, shared_dim=shared_dim, device=device)
+    model.to(device)
     if state_dict is not None:
-        try:
-            model.load_state_dict(state_dict)
-            print("✅ Successfully loaded model weights")
-        except Exception as e:
-            print(f"⚠️ Error loading model weights: {e}")
-
+        model.load_state_dict(state_dict)
+        print("✅ Loaded model state dict.")
+    else:
+        print("ℹ️ No state dict provided. Initializing model with random weights.")
     return model
+
 
 # ========== Training ==========
 
 def collate_fn(batch):
-    """
-    Custom collate function to handle variable-length audio and text embeddings.
-    """
     audio_embeddings = torch.tensor([item[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN] for item in batch])
     description_embeddings = torch.tensor([item[GRANITE_DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
     neg_description_embeddings = torch.tensor([item[GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN] for item in batch])
 
-    return audio_embeddings, description_embeddings, neg_description_embeddings
+    for name, tensor in zip(["audio", "desc", "neg_desc"], [audio_embeddings, description_embeddings, neg_description_embeddings]):
+        if not torch.isfinite(tensor).all():
+            print(f"⚠️ Non-finite or NaN values detected in {name} embeddings. Skipping batch.")
+            return None
+
+    return audio_embeddings.squeeze(1).to(DEVICE), description_embeddings.squeeze(1).to(DEVICE), neg_description_embeddings.squeeze(1).to(DEVICE)
 
 
 def evaluate(model, dataloader):
     model.eval()
     total_loss = 0
     with torch.no_grad():
-        for audio_emb, desc_emb, neg_desc_emb in dataloader:
-            audio_emb = audio_emb.to(DEVICE)
-            desc_emb = desc_emb.to(DEVICE)
-            neg_desc_emb = neg_desc_emb.to(DEVICE)
-
-            loss_list = model.forward([audio_emb, desc_emb])
-            loss = loss_list[0].mean()
-
-            audio_latent = model.encoders[0](audio_emb)
-            neg_latent = model.encoders[1](neg_desc_emb)
-            neg_sim = F.cosine_similarity(audio_latent, neg_latent)
-            contrastive_loss = F.relu(neg_sim - 0.5).mean()
-            loss += contrastive_loss
-
+        for batch in tqdm(dataloader, desc="Evaluation"):
+            if batch is None:
+                continue
+            audio_emb, desc_emb, neg_desc_emb = batch
+            audio_encoding = model.encode_speech(audio_emb)
+            desc_encoding = model.encode_text(desc_emb)
+            neg_desc_encoding = model.encode_text(neg_desc_emb)
+            loss = model.contrastive_loss(audio_encoding, desc_encoding, neg_desc_encoding)
             total_loss += loss.item()
-
     return total_loss / len(dataloader)
 
 
 def train():
-    dataset = load_from_disk(ENRICHED_DATASET_V2_PATH).cast_column(AUDIO_COLUMN, Audio())
-    dataset = dataset.train_test_split(test_size=0.1, seed=42)
+    dataset_dict = load_from_disk(ENRICHED_DATASET_V2_PATH)
+    train_dataset = dataset_dict["train"].cast_column(AUDIO_COLUMN, Audio())
+    test_dataset = dataset_dict["test"].cast_column(AUDIO_COLUMN, Audio())
 
-    train_loader = DataLoader(dataset["train"], batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(dataset["test"], batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
     model = create_dcca_model()
-
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.3, patience=5)
 
     best_val_loss = float("inf")
-
     train_losses, val_losses = [], []
+
     for epoch in range(NUM_EPOCHS):
         model.train()
         total_train_loss = 0
-        for audio_emb, desc_emb, neg_desc_emb in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}"):
-            audio_emb = audio_emb.to(DEVICE)
-            desc_emb = desc_emb.to(DEVICE)
-            neg_desc_emb = neg_desc_emb.to(DEVICE)
-
-            loss_list = model.forward([audio_emb, desc_emb])
-            loss = loss_list[0].mean()
-
-            audio_latent = model.encoders[0](audio_emb)
-            desc_latent = model.encoders[1](desc_emb)
-            neg_desc_latent = model.encoders[1](neg_desc_emb)
-            contrast_loss = contrastive_loss(audio_latent, desc_latent, neg_desc_latent)
-
-            loss += contrast_loss
-
+        for batch in tqdm(train_loader, desc=f" Training Epoch {epoch + 1}/{NUM_EPOCHS}"):
+            if batch is None:
+                continue
+            audio_emb, desc_emb, neg_desc_emb = batch
+            audio_encoding = model.encode_speech(audio_emb)
+            desc_encoding = model.encode_text(desc_emb)
+            neg_desc_encoding = model.encode_text(neg_desc_emb)
+            loss = model.contrastive_loss(audio_encoding, desc_encoding, neg_desc_encoding)
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
 
             total_train_loss += loss.item()
@@ -143,18 +212,12 @@ def train():
 
         print(f"Epoch {epoch + 1} - Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
-        # Save the best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save( {"epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
-             "val_loss": best_val_loss}, DCCA_MODEL_PATH)
+            torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "val_loss": best_val_loss}, DCCA_MODEL_PATH)
             print("✅ Saved new best model.")
 
-
-
     print("🏁 Training complete.")
-
-    # ===== TESTING =====
     print("🔍 Evaluating best model on validation set...")
     model.load_state_dict(torch.load(DCCA_MODEL_PATH)["model_state_dict"])
     final_val_loss = evaluate(model, val_loader)
