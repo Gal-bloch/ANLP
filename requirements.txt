@@ -102,7 +102,7 @@ networkx==2.8.8
 nltk==3.9.1
 num2words==0.5.14
 numba==0.61.2
-numpy~=2.2.4
+numpy>=1.19.0,<2.0.0
 packaging==24.2
 pandas~=2.2.3
 pandocfilters==1.5.1

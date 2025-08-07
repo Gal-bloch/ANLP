@@ -211,7 +211,7 @@ def generate_negated_descriptions_batch(texts):
     - accent (British to American, etc.)
 
     Descriptions:
-    {'\n'.join(f'{i+1}. "{text}"' for i, text in enumerate(texts))}
+    """ + '\n'.join(f'{i+1}. "{text}"' for i, text in enumerate(texts)) + """
 
     Provide your answer as numbered list, with ONLY the negated descriptions (no explanations).
     """
