@@ -2,7 +2,6 @@ import streamlit as st
 import torch
 import torchaudio
 import numpy as np
-import random
 from sentence_transformers import SentenceTransformer
 from resemblyzer import VoiceEncoder, wav_to_mel_spectrogram
 import torch.nn.functional as F
@@ -10,17 +9,19 @@ import soundfile as sf
 import os
 import logging
 from datasets import load_from_disk, Audio
-from Voice2Embedding import Voice2Embedding
-from DCCA import create_dcca_model
+from Voice2Embedding import Voice2Embedding, VOICE2EMBEDDING_DESCRIPTION_EMBEDDER
+from DCCA import create_dcca_model, DCCA_DESCRIPTION_EMBEDDER
 from create_dataset import (
     RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN, 
     GRANITE_DESCRIPTION_EMBEDDING_COLUMN,
-    GRANITE_NEGATIVE_DESCRIPTION_EMBEDDING_COLUMN
+    ENRICHED_DATASET_V2_PATH,
+    DESCRIPTION_COLUMN,
+    ID_COLUMN,
+    AUDIO_COLUMN
 )
 from tempfile import NamedTemporaryFile
 import json
 import pickle
-from pathlib import Path
 
 # Initialize session state for human evaluation
 if 'precomputed_embeddings' not in st.session_state:
@@ -69,7 +70,7 @@ def find_available_models():
     
     # Search only in the specific models directory
     search_paths = [
-        "/Users/galbloch/Desktop/school/git/ANLP/models"
+        "../models"
     ]
     
     for path in search_paths:
@@ -86,10 +87,10 @@ def find_available_models():
 
 
 def detect_model_type(model_file):
-    """Detect if model is DCCAE or fine-tuned based on filename"""
+    """Detect if model is DCCA or fine-tuned based on filename"""
     filename = os.path.basename(model_file).lower()
     if 'dccae' in filename or 'dcca' in filename:
-        return "dccae"
+        return "dcca"
     else:
         return "finetuned"
 
@@ -160,7 +161,7 @@ def load_cotts_dataset():
     """Load the CoTTS dataset"""
     try:
         logger.info("Loading CoTTS dataset from disk")
-        dataset = load_from_disk("/Users/galbloch/Desktop/school/git/ANLP/datasets/Enriched_CoTTS_dataset/Enriched_CoTTS_dataset_v2")
+        dataset = load_from_disk(ENRICHED_DATASET_V2_PATH)
         
         # Check if it's already a DatasetDict or a regular Dataset
         if hasattr(dataset, 'keys') and 'train' in dataset.keys():
@@ -175,15 +176,15 @@ def load_cotts_dataset():
             
             # Remove segment_id if it exists, keep other columns as-is
             columns_to_remove = []
-            if "segment_id" in dataset.column_names:
-                columns_to_remove.append("segment_id")
+            if ID_COLUMN in dataset.column_names:
+                columns_to_remove.append(ID_COLUMN)
             
             if columns_to_remove:
                 dataset = dataset.remove_columns(columns_to_remove)
             
             # Rename description column if needed
-            if "description" in dataset.column_names and "text_description" not in dataset.column_names:
-                dataset = dataset.rename_column("description", "text_description")
+            if "description" in dataset.column_names and DESCRIPTION_COLUMN not in dataset.column_names:
+                dataset = dataset.rename_column("description", DESCRIPTION_COLUMN)
             
             split_dataset = dataset.train_test_split(test_size=0.1, seed=42)
         
@@ -230,7 +231,7 @@ def load_audio_file(audio_data):
 
 @st.cache_resource
 def load_model(model_file):
-    """Load either DCCAE or fine-tuned model based on model file"""
+    """Load either DCCA or fine-tuned model based on model file"""
     if not model_file or not os.path.exists(model_file):
         return None, None, None, None
         
@@ -239,9 +240,9 @@ def load_model(model_file):
     
     model_type = detect_model_type(model_file)
     
-    if model_type == "dccae":
-        # Load DCCAE model
-        logger.info(f"Loading DCCAE model from {model_file}...")
+    if model_type == "dcca":
+        # Load DCCA model
+        logger.info(f"Loading DCCA model from {model_file}...")
         try:
             checkpoint = torch.load(model_file, map_location=device)
             logger.info(f"Checkpoint keys: {list(checkpoint.keys()) if isinstance(checkpoint, dict) else 'Not a dict'}")
@@ -271,29 +272,25 @@ def load_model(model_file):
             
             model.to(device)
             model.eval()
-            
-            # For DCCAE, we also need the text embedding model for new queries
-            text_model = SentenceTransformer("ibm-granite/granite-embedding-125m-english")
+
             
             # Test if the model is working properly
-            model_works = test_dccae_model(model, text_model, device)
+            model_works = test_dcca_model(model, DCCA_DESCRIPTION_EMBEDDER, device)
             if not model_works:
-                logger.warning("⚠️ DCCAE model test failed - results may be unreliable")
+                logger.warning("⚠️ DCCA model test failed - results may be unreliable")
             
-            logger.info("✅ Successfully loaded DCCAE model")
-            return model, text_model, device, "dccae"
+            logger.info("✅ Successfully loaded DCCA model")
+            return model, DCCA_DESCRIPTION_EMBEDDER, device, "dcca"
             
         except Exception as e:
-            logger.error(f"Failed to load DCCAE model: {e}")
-            st.error(f"Failed to load DCCAE model: {e}")
+            logger.error(f"Failed to load DCCA model: {e}")
+            st.error(f"Failed to load DCCA model: {e}")
             return None, None, None, None
     
     else:  # finetuned model
         # Load fine-tuned Voice2Embedding model
         logger.info(f"Loading fine-tuned Voice2Embedding model from {model_file}...")
-        dense_embedding_model = SentenceTransformer("ibm-granite/granite-embedding-125m-english")
-        voice_encoder = VoiceEncoder(device=device)
-        model = Voice2Embedding(voice_encoder, projection_dim=dense_embedding_model.get_sentence_embedding_dimension())
+        model = Voice2Embedding()
         
         try:
             checkpoint = torch.load(model_file, map_location=device)
@@ -322,16 +319,16 @@ def load_model(model_file):
         model.to(device)
         model.eval()
         
-        return model, dense_embedding_model, device, "finetuned"
+        return model, VOICE2EMBEDDING_DESCRIPTION_EMBEDDER, device, "finetuned"
 
 
 def extract_audio_embedding(audio_data, model, device, model_type="finetuned"):
-    """Extract audio embedding using either DCCAE or fine-tuned model"""
+    """Extract audio embedding using either DCCA or fine-tuned model"""
     try:
-        if model_type == "dccae":
-            # For DCCAE, we expect precomputed embeddings in the dataset
+        if model_type == "dcca":
+            # For DCCA, we expect precomputed embeddings in the dataset
             # This function is mainly for compatibility
-            logger.warning("extract_audio_embedding called for DCCAE model - should use precomputed embeddings")
+            logger.warning("extract_audio_embedding called for DCCA model - should use precomputed embeddings")
             return None
         
         # For fine-tuned model, compute embeddings in real-time
@@ -351,8 +348,8 @@ def extract_audio_embedding(audio_data, model, device, model_type="finetuned"):
 def extract_text_embedding(text, text_model, model_type="finetuned"):
     """Extract text embedding - works for both model types"""
     with torch.no_grad():
-        if model_type == "dccae":
-            # For DCCAE, encode text and then pass through model
+        if model_type == "dcca":
+            # For DCCA, encode text and then pass through model
             text_embedding = text_model.encode([text], convert_to_tensor=True)
             return text_embedding.cpu().numpy()
         else:
@@ -362,10 +359,13 @@ def extract_text_embedding(text, text_model, model_type="finetuned"):
 
 
 def cosine_similarity(emb1, emb2):
-    if emb1 is None or emb2 is None or emb1.shape[1] != emb2.shape[1]:
+    if emb1 is None or emb2 is None:
         return 0
     tensor1 = torch.tensor(emb1, dtype=torch.float32)
     tensor2 = torch.tensor(emb2, dtype=torch.float32)
+    if tensor1.shape[1] != tensor2.shape[1]:
+        return 0
+
     sim = F.cosine_similarity(tensor1, tensor2, dim=1)
     return sim.mean().item()
 
@@ -385,9 +385,9 @@ def precompute_voice_embeddings(_dataset, model, device, model_type="finetuned",
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    if model_type == "dccae":
-        # For DCCAE, use precomputed embeddings from the dataset
-        logger.info("Using precomputed embeddings from dataset for DCCAE model")
+    if model_type == "dcca":
+        # For DCCA, use precomputed embeddings from the dataset
+        logger.info("Using precomputed embeddings from dataset for DCCA model")
         
         for i, sample in enumerate(limited_dataset):
             if i % 10 == 0:
@@ -401,8 +401,8 @@ def precompute_voice_embeddings(_dataset, model, device, model_type="finetuned",
                 
                 precomputed_embeddings.append({
                     'index': i,
-                    'description': sample['text_description'],
-                    'audio': sample['audio'],
+                    'description': sample[DESCRIPTION_COLUMN],
+                    'audio': sample[AUDIO_COLUMN],
                     'embedding': audio_embedding,
                     'precomputed_text_embedding': np.array(sample.get(GRANITE_DESCRIPTION_EMBEDDING_COLUMN, [])).reshape(1, -1) if GRANITE_DESCRIPTION_EMBEDDING_COLUMN in sample else None
                 })
@@ -420,8 +420,8 @@ def precompute_voice_embeddings(_dataset, model, device, model_type="finetuned",
             if audio_embedding is not None:
                 precomputed_embeddings.append({
                     'index': i,
-                    'description': sample['text_description'],
-                    'audio': sample['audio'],
+                    'description': sample[DESCRIPTION_COLUMN],
+                    'audio': sample[AUDIO_COLUMN],
                     'embedding': audio_embedding
                 })
 
@@ -440,8 +440,8 @@ def precompute_voice_embeddings(_dataset, model, device, model_type="finetuned",
 def search_for_description(description, top_k=3, model_type="finetuned", model=None, text_model=None, device=None):
     """Search for voices matching a description"""
     
-    if model_type == "dccae":
-        # For DCCAE model, encode the text and then pass through DCCAE text encoder
+    if model_type == "dcca":
+        # For DCCA model, encode the text and then pass through DCCA text encoder
         raw_text_embedding = text_model.encode([description], convert_to_tensor=True, device=device)
         with torch.no_grad():
             # Ensure proper tensor shape and device placement
@@ -449,7 +449,7 @@ def search_for_description(description, top_k=3, model_type="finetuned", model=N
             query_embedding = model.encode_text(text_tensor).cpu().numpy()
         
         # Debug: Print query embedding info
-        logger.info(f"DCCAE Query embedding shape: {query_embedding.shape}, mean: {query_embedding.mean():.4f}, std: {query_embedding.std():.4f}")
+        logger.info(f"DCCA Query embedding shape: {query_embedding.shape}, mean: {query_embedding.mean():.4f}, std: {query_embedding.std():.4f}")
     else:
         # For fine-tuned model, just get text embedding
         query_embedding = extract_text_embedding(description, text_model, model_type)
@@ -460,8 +460,8 @@ def search_for_description(description, top_k=3, model_type="finetuned", model=N
     results = []
     similarities = []  # Debug: collect similarities
     for i, item in enumerate(st.session_state.precomputed_embeddings):
-        if model_type == "dccae":
-            # For DCCAE, pass the precomputed audio embedding through the model
+        if model_type == "dcca":
+            # For DCCA, pass the precomputed audio embedding through the model
             if 'embedding' in item:
                 # Process audio embedding similar to classifier evaluation
                 audio_embedding_tensor = torch.tensor(item['embedding'], dtype=torch.float32).squeeze().to(device)
@@ -470,7 +470,7 @@ def search_for_description(description, top_k=3, model_type="finetuned", model=N
                 
                 # Debug: Print first few audio embedding info
                 if i < 3:
-                    logger.info(f"DCCAE Audio embedding {i} shape: {processed_audio_embedding.shape}, mean: {processed_audio_embedding.mean():.4f}, std: {processed_audio_embedding.std():.4f}")
+                    logger.info(f"DCCA Audio embedding {i} shape: {processed_audio_embedding.shape}, mean: {processed_audio_embedding.mean():.4f}, std: {processed_audio_embedding.std():.4f}")
                 
                 similarity = cosine_similarity(query_embedding.reshape(1, -1), processed_audio_embedding.reshape(1, -1))
                 similarities.append(similarity)
@@ -570,9 +570,9 @@ def save_evaluation_results():
 
 # Add after the other utility functions
 
-def test_dccae_model(model, text_model, device):
-    """Test if DCCAE model is working properly by checking output variance"""
-    logger.info("Testing DCCAE model functionality...")
+def test_dcca_model(model, text_model, device):
+    """Test if DCCA model is working properly by checking output variance"""
+    logger.info("Testing DCCA model functionality...")
     
     # Create some test text inputs
     test_descriptions = [
@@ -599,7 +599,7 @@ def test_dccae_model(model, text_model, device):
     logger.info(f"Overall text output std: {output_std:.4f}")
     
     if output_std < 1e-6:
-        logger.warning("⚠️ DCCAE text encoder outputs are nearly identical - model may not be trained!")
+        logger.warning("⚠️ DCCA text encoder outputs are nearly identical - model may not be trained!")
         return False
     
     # Test with some dummy audio embeddings
@@ -623,10 +623,10 @@ def test_dccae_model(model, text_model, device):
     logger.info(f"Overall audio output std: {audio_output_std:.4f}")
     
     if audio_output_std < 1e-6:
-        logger.warning("⚠️ DCCAE audio encoder outputs are nearly identical - model may not be trained!")
+        logger.warning("⚠️ DCCA audio encoder outputs are nearly identical - model may not be trained!")
         return False
     
-    logger.info("✅ DCCAE model appears to be working correctly")
+    logger.info("✅ DCCA model appears to be working correctly")
     return True
 
 
@@ -655,7 +655,7 @@ for model_file in available_models:
 selected_display_name = st.sidebar.selectbox(
     "Select Model",
     model_display_names,
-    help="Choose a model file. DCCAE models use precomputed embeddings, others compute embeddings in real-time."
+    help="Choose a model file. DCCA models use precomputed embeddings, others compute embeddings in real-time."
 )
 
 # Get the selected model file
@@ -682,8 +682,8 @@ if selected_model_file != st.session_state.selected_model_file:
 
 # Model info
 st.sidebar.info(f"**Selected**: {os.path.basename(selected_model_file)}")
-if model_type == "dccae":
-    st.sidebar.info("🔬 **DCCAE Model**: Uses precomputed embeddings from dataset. Faster inference.")
+if model_type == "dcca":
+    st.sidebar.info("🔬 **DCCA Model**: Uses precomputed embeddings from dataset. Faster inference.")
 else:
     st.sidebar.info("🎯 **Fine-tuned Model**: Computes embeddings in real-time. More flexible.")
 
@@ -712,9 +712,9 @@ else:
             st.success(f"✅ Loaded {len(cached_embeddings)} precomputed embeddings from cache!")
         else:
             # Need to compute embeddings
-            if model_type == "dccae":
-                st.info("📁 DCCAE model detected. Loading embeddings from dataset...")
-                button_text = "🔄 Load DCCAE Embeddings from Dataset"
+            if model_type == "dcca":
+                st.info("📁 DCCA model detected. Loading embeddings from dataset...")
+                button_text = "🔄 Load DCCA Embeddings from Dataset"
             else:
                 st.warning("No cached embeddings found. Computing embeddings...")
                 button_text = "🔄 Compute Fine-tuned Model Embeddings"
@@ -741,7 +741,7 @@ else:
                         st.error(f"Failed to clear cache: {e}")
 
             if st.session_state.precomputed_embeddings is None:
-                if model_type == "dccae":
+                if model_type == "dcca":
                     st.info(f"Click '{button_text}' to load embeddings from the dataset.")
                 else:
                     st.info(f"Click '{button_text}' to start the evaluation.")

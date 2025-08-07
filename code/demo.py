@@ -10,8 +10,8 @@ import soundfile as sf
 import os
 import logging
 from datasets import load_from_disk, Audio
-from Voice2Embedding import Voice2Embedding
-from create_dataset import ENRICHED_DATASET_PATH, AUDIO_COLUMN, DESCRIPTION_COLUMN, GRANITE_DESCRIPTION_EMBEDDING_COLUMN
+from Voice2Embedding import Voice2Embedding, VOICE2EMBEDDING_MODEL_PATH, VOICE2EMBEDDING_DESCRIPTION_EMBEDDER
+from create_dataset import ENRICHED_DATASET_V2_PATH, AUDIO_COLUMN, DESCRIPTION_COLUMN, GRANITE_DESCRIPTION_EMBEDDING_COLUMN
 
 # Initialize session state
 if 'selected_idx' not in st.session_state:
@@ -39,11 +39,9 @@ def load_cotts_dataset():
     """
     try:
         logger.info("Loading CoTTS dataset from disk")
-        dataset = load_from_disk(ENRICHED_DATASET_PATH)
-        dataset = dataset.cast_column(AUDIO_COLUMN, Audio())
-
-        # Split into train and validation (same as in training)
-        split_dataset = dataset.train_test_split(test_size=0.1, seed=42)
+        split_dataset = load_from_disk(ENRICHED_DATASET_V2_PATH)
+        split_dataset["train"] = split_dataset["train"].cast_column(AUDIO_COLUMN, Audio())
+        split_dataset["test"] = split_dataset["test"].cast_column(AUDIO_COLUMN, Audio())
 
         logger.info(
             f"✅ Successfully loaded dataset with {len(split_dataset['train'])} train and {len(split_dataset['test'])} test samples")
@@ -91,18 +89,16 @@ def load_audio_file(audio_data):
 @st.cache_resource
 def load_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-    dense_embedding_model = SentenceTransformer("ibm-granite/granite-embedding-125m-english")
-    voice_encoder = VoiceEncoder(device=device)
-    model = Voice2Embedding(voice_encoder, projection_dim=dense_embedding_model.get_sentence_embedding_dimension())
+    model = Voice2Embedding()
     try:
-        checkpoint = torch.load("../models/best_voice2embedding_model.pt", map_location=device)
+        checkpoint = torch.load(VOICE2EMBEDDING_MODEL_PATH, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         logger.info("Successfully loaded model weights")
     except Exception as e:
         logger.warning(f"Could not load model weights: {e}. Using uninitialized model.")
     model.to(device)
     model.eval()
-    return model, dense_embedding_model, device
+    return model, VOICE2EMBEDDING_DESCRIPTION_EMBEDDER, device
 
 
 def extract_audio_embedding(audio_data, model, device):
@@ -121,12 +117,14 @@ def extract_audio_embedding(audio_data, model, device):
         return None
 
 def cosine_similarity(emb1, emb2):
-    if emb1 is None or emb2 is None or emb1.shape[1] != emb2.shape[1]:
-        return 0  # Return zero similarity for invalid inputs
-
+    if emb1 is None or emb2 is None:
+        return 0  # Return zero similarity for None inputs
     # Convert to PyTorch tensors
     tensor1 = torch.tensor(emb1, dtype=torch.float32)
     tensor2 = torch.tensor(emb2, dtype=torch.float32)
+    # Check if embeddings are valid
+    if tensor1.shape[1] != tensor2.shape[1]:
+        return 0  # Return zero similarity for invalid inputs
 
     # Compute cosine similarity along the feature dimension
     sim = F.cosine_similarity(tensor1, tensor2, dim=1)
@@ -143,12 +141,6 @@ def update_selected_idx():
     # Update the text input with the new sample's description
     selected_sample = sample_dataset[st.session_state.selected_idx]
     st.session_state.text_input = selected_sample[DESCRIPTION_COLUMN]
-
-
-def update_text_input():
-    """Keep track of text input changes"""
-    # This just stores the current text input value in session state
-    pass  # The actual update happens automatically through the key
 
 
 def compare_voice_to_text():
@@ -184,7 +176,7 @@ else:
     sample_size = min(100, len(dataset['train']))
 
     # Use consistent sampling with fixed seed for stability
-    random.seed(42)
+    random.seed(213)
     sample_indices = random.sample(range(len(dataset['train'])), sample_size)
     sample_dataset = dataset['train'].select(sample_indices)
 
@@ -208,7 +200,7 @@ else:
 
     # Display sample information
     st.subheader("Current sample")
-    st.write(f"**Speaker description:** {selected_sample['text_description']}")
+    st.write(f"**Speaker description:** {selected_sample[DESCRIPTION_COLUMN]}")
 
     # Process and display audio
     wav, sample_rate = load_audio_file(selected_sample[AUDIO_COLUMN])

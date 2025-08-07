@@ -8,7 +8,6 @@ from create_dataset import GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLU
 import os
 from DCCA import create_dcca_model, DCCA_MODEL_PATH
 from Voice2Embedding import Voice2Embedding, VOICE2EMBEDDING_MODEL_PATH
-import glob
 import pandas as pd
 
 
