@@ -7,6 +7,7 @@ from create_dataset import ENRICHED_DATASET_V2_PATH, RESEMBLYZER_SPEAKER_EMBEDDI
 from create_dataset import GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLUMN, SPEED_COLUMN, ENERGY_COLUMN
 import os
 from DCCA import create_dcca_model, DCCA_MODEL_PATH
+from DCCAV2 import create_dcca_v2_model, DCCA_V2_MODEL_PATH
 from Voice2Embedding import Voice2Embedding, VOICE2EMBEDDING_MODEL_PATH
 import pandas as pd
 
@@ -20,7 +21,7 @@ LEARNING_RATE = 1e-3
 DCCA_INPUT_DIM = 128
 VOICE2EMBEDDING_INPUT_DIM = 768
 
-MODEL_TYPES = ["dcca", "voice2embedding", "baseline"]
+MODEL_TYPES = ["dcca", "dccav2",  "voice2embedding", "baseline"]
 CLASS_TYPES = [GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLUMN, SPEED_COLUMN, ENERGY_COLUMN]
 
 class FeatureClassificationDataset(Dataset):
@@ -189,6 +190,13 @@ def run_test(class_title, model_type):
         speech_encoder = model.encode_speech
         description_encoder = model.encode_text
 
+    elif model_type == "dccav2":
+        # Load the trained DCCAE model
+        model_state_dict = torch.load(DCCA_V2_MODEL_PATH, map_location=DEVICE)["model_state_dict"]
+        model = create_dcca_v2_model(state_dict=model_state_dict)
+        speech_encoder = model.encode_speech
+        description_encoder = model.encode_text
+
     elif model_type == "voice2embedding":
         model_state_dict = torch.load(VOICE2EMBEDDING_MODEL_PATH, map_location=DEVICE)["model_state_dict"]
         model = Voice2Embedding()
@@ -262,8 +270,8 @@ def summarize_results():
 
     # Define paths and constants
     checkpoint_dir = r"../models/Evaluation_Classifiers/"
-    test_types = [GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLUMN, SPEED_COLUMN, ENERGY_COLUMN]
-    model_types = ["dcca", "voice2embedding", "baseline"]
+    test_types = CLASS_TYPES
+    model_types = MODEL_TYPES
     modalities = ["Text", "Speech"]
     label_types = ["Correct", "Random"]
 
@@ -308,6 +316,6 @@ def summarize_results():
 
 
 if __name__ == "__main__":
-    # run_experiments()
+    run_experiments()
     summarize_results()
     print("All tests completed.")
