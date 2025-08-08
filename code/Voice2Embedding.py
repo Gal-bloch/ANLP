@@ -109,27 +109,27 @@ class Voice2Embedding(nn.Module):
 
         return normalized
 
-    def forward(self, speech_mel_spec):
+    def forward(self, speech_mel_specs):
         with torch.no_grad():  # Don't backprop through base model initially
-            speech_embedding = self.base_model(speech_mel_spec)
+            speech_embedding = self.base_model(speech_mel_specs)
 
         return self.encode_speech(speech_embedding)
 
     @staticmethod
-    def loss(speech_encoding, description_embedding):
-        return 1 - F.cosine_similarity(speech_encoding, description_embedding, dim=1).mean()
+    def loss(speech_encodings, description_embeddings):
+        return 1 - F.cosine_similarity(speech_encodings, description_embeddings, dim=1).mean()
 
     @staticmethod
-    def contrastive_loss(speech_encoding, positive_reference, negative_reference):
-        if type(negative_reference) == str:
-            negative_reference = VOICE2EMBEDDING_DESCRIPTION_EMBEDDER(negative_reference)
-        if type(positive_reference) == str:
-            positive_reference = VOICE2EMBEDDING_DESCRIPTION_EMBEDDER(positive_reference)
+    def contrastive_loss(speech_encodings, positive_references, negative_references):
+        if type(negative_references) == str:
+            negative_references = VOICE2EMBEDDING_DESCRIPTION_EMBEDDER(negative_references)
+        if type(positive_references) == str:
+            positive_references = VOICE2EMBEDDING_DESCRIPTION_EMBEDDER(positive_references)
 
-        pos_distance = 1 - F.cosine_similarity(speech_encoding, positive_reference, dim=1)
-        neg_distance = 1 - F.cosine_similarity(speech_encoding, negative_reference, dim=1)
+        pos_distances = 1 - F.cosine_similarity(speech_encodings, positive_references, dim=1)
+        neg_distances = 1 - F.cosine_similarity(speech_encodings, negative_references, dim=1)
 
-        return (pos_distance - neg_distance).mean()
+        return (pos_distances - neg_distances).mean()
 
 
 

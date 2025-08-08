@@ -10,7 +10,7 @@ import os
 import logging
 from datasets import load_from_disk, Audio
 from Voice2Embedding import Voice2Embedding, VOICE2EMBEDDING_DESCRIPTION_EMBEDDER
-from DCCA import create_dcca_model, DCCA_DESCRIPTION_EMBEDDER
+from DCCA import create_dcca_model, DCCA_DESCRIPTION_EMBEDDER, DCCASpeechText
 from create_dataset import (
     RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN, 
     GRANITE_DESCRIPTION_EMBEDDING_COLUMN,
@@ -471,7 +471,7 @@ def search_for_description(description, top_k=3, model_type="finetuned", model=N
                 # Debug: Print first few audio embedding info
                 if i < 3:
                     logger.info(f"DCCA Audio embedding {i} shape: {processed_audio_embedding.shape}, mean: {processed_audio_embedding.mean():.4f}, std: {processed_audio_embedding.std():.4f}")
-                
+
                 similarity = cosine_similarity(query_embedding.reshape(1, -1), processed_audio_embedding.reshape(1, -1))
                 similarities.append(similarity)
             else:

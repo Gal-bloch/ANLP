@@ -72,8 +72,8 @@ class DCCASpeechText(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def encode_speech(self, audio_emb):
-        x = audio_emb
+    def encode_speech(self, audio_embs):
+        x = audio_embs
         for i, layer in enumerate(self.audio_encoder):
             x = layer(x)
             if not torch.isfinite(x).all():
@@ -81,8 +81,8 @@ class DCCASpeechText(nn.Module):
                 break
         return x
 
-    def encode_text(self, text_emb):
-        x = text_emb
+    def encode_text(self, text_embs):
+        x = text_embs
         for i, layer in enumerate(self.text_encoder):
             x = layer(x)
             if not torch.isfinite(x).all():
@@ -90,9 +90,9 @@ class DCCASpeechText(nn.Module):
                 break
         return x
 
-    def forward(self, audio_emb, text_emb):
-        audio_encoding = self.encode_speech(audio_emb)
-        text_encoding = self.encode_text(text_emb)
+    def forward(self, audio_embs, text_embs):
+        audio_encoding = self.encode_speech(audio_embs)
+        text_encoding = self.encode_text(text_embs)
         return audio_encoding, text_encoding
 
     @staticmethod
@@ -115,13 +115,13 @@ class DCCASpeechText(nn.Module):
         return -canonical_corrs.mean()
 
     @staticmethod
-    def loss(audio_encoding, text_encoding):
-        return DCCASpeechText.correlation_loss([audio_encoding, text_encoding])
+    def loss(audio_encodings, text_encodings):
+        return DCCASpeechText.correlation_loss([audio_encodings, text_encodings])
 
     @staticmethod
-    def contrastive_loss(audio_encoding, text_encoding, neg_text_encoding):
-        pos_correlation_loss = DCCASpeechText.correlation_loss([audio_encoding, text_encoding])
-        neg_correlation_loss = DCCASpeechText.correlation_loss([audio_encoding, neg_text_encoding])
+    def contrastive_loss(audio_encodings, text_encodings, neg_text_encodings):
+        pos_correlation_loss = DCCASpeechText.correlation_loss([audio_encodings, text_encodings])
+        neg_correlation_loss = DCCASpeechText.correlation_loss([audio_encodings, neg_text_encodings])
         return pos_correlation_loss - neg_correlation_loss
 
 
