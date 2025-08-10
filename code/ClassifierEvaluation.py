@@ -18,10 +18,7 @@ BATCH_SIZE = 32
 NUM_EPOCHS = 50
 LEARNING_RATE = 1e-3
 
-DCCA_INPUT_DIM = 128
-VOICE2EMBEDDING_INPUT_DIM = 768
-
-MODEL_TYPES = ["dcca", "dccav2",  "voice2embedding", "baseline"]
+MODEL_TYPES = ["dccav2", "dcca", "voice2embedding", "baseline"]
 CLASS_TYPES = [GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLUMN, SPEED_COLUMN, ENERGY_COLUMN]
 
 class FeatureClassificationDataset(Dataset):
@@ -187,6 +184,7 @@ def run_test(class_title, model_type):
         # Load the trained DCCAE model
         model_state_dict = torch.load(DCCA_MODEL_PATH, map_location=DEVICE)["model_state_dict"]
         model = create_dcca_model(state_dict=model_state_dict)
+        model.eval()
         speech_encoder = model.encode_speech
         description_encoder = model.encode_text
 
@@ -194,6 +192,7 @@ def run_test(class_title, model_type):
         # Load the trained DCCAE model
         model_state_dict = torch.load(DCCA_V2_MODEL_PATH, map_location=DEVICE)["model_state_dict"]
         model = create_dcca_v2_model(state_dict=model_state_dict)
+        model.eval()
         speech_encoder = model.encode_speech
         description_encoder = model.encode_text
 
@@ -201,6 +200,7 @@ def run_test(class_title, model_type):
         model_state_dict = torch.load(VOICE2EMBEDDING_MODEL_PATH, map_location=DEVICE)["model_state_dict"]
         model = Voice2Embedding()
         model.load_state_dict(model_state_dict)
+        model.eval()
         speech_encoder = model.encode_speech
         description_encoder = lambda x: x
 
@@ -266,8 +266,6 @@ def run_experiments():
 
 # Summarize results
 def summarize_results():
-
-
     # Define paths and constants
     checkpoint_dir = r"../models/Evaluation_Classifiers/"
     test_types = CLASS_TYPES

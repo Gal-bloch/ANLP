@@ -119,7 +119,7 @@ class DCCAV2SpeechText(nn.Module):
     def encode_text(self, text_embs):
         # Handle different input dimensions
         if text_embs.dim() == 1:
-            speech_embeddings = text_embs.unsqueeze(0)
+            text_embs = text_embs.unsqueeze(0)
         if text_embs.dim() == 2:
             text_embs = text_embs.unsqueeze(1)
 
