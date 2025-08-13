@@ -50,9 +50,9 @@ PITCH_COLUMN = "pitch"
 ENERGY_COLUMN = "energy"
 EMOTION_COLUMN = "emotion"
 
-COMBINED_DATASET_PATH = "../datasets/CoTTS_dataset"
-ENRICHED_DATASET_PATH = "../datasets/Enriched_CoTTS_dataset"
-ENRICHED_DATASET_V2_PATH = "../datasets/Enriched_CoTTS_dataset_v2"
+COMBINED_DATASET_PATH = r"../datasets/CoTTS_dataset"
+ENRICHED_DATASET_PATH = r"../datasets/Enriched_CoTTS_dataset"
+ENRICHED_DATASET_V2_PATH = r"../datasets/Enriched_CoTTS_dataset_v2"
 
 VALID_DATASET_SIZES = ["xs", "s", "m", "l", "xl"]
 

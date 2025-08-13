@@ -88,6 +88,8 @@ class DCCAV3SpeechText(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def encode_speech(self, audio_embs):
+        if audio_embs.dim() == 1:
+            audio_embs = audio_embs.unsqueeze(0)
         if audio_embs.dim() == 2:
             audio_embs = audio_embs.unsqueeze(1)
 
@@ -99,6 +101,8 @@ class DCCAV3SpeechText(nn.Module):
         return normalized
 
     def encode_text(self, text_embs):
+        if text_embs.dim() == 1:
+            text_embs = text_embs.unsqueeze(0)
         if text_embs.dim() == 2:
             text_embs = text_embs.unsqueeze(1)
 

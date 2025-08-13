@@ -2,16 +2,15 @@ import streamlit as st
 import torch
 import torchaudio
 import numpy as np
-import random
-from sentence_transformers import SentenceTransformer
-from resemblyzer import VoiceEncoder, wav_to_mel_spectrogram
+from resemblyzer import wav_to_mel_spectrogram
 import torch.nn.functional as F
 import soundfile as sf
 import os
 import logging
 from datasets import load_from_disk, Audio
 from Voice2Embedding import Voice2Embedding, VOICE2EMBEDDING_DESCRIPTION_EMBEDDER
-from DCCA import create_dcca_model, DCCA_DESCRIPTION_EMBEDDER, DCCASpeechText
+from DCCA import create_dcca_model, DCCA_DESCRIPTION_EMBEDDER
+from DCCAV2 import create_dcca_v2_model
 try:
     # Optional import for V3 models
     from DCCAV3 import create_dcca_v3_model
@@ -21,8 +20,7 @@ except ImportError:
 from create_dataset import (
     ENRICHED_DATASET_V2_PATH, 
     AUDIO_COLUMN, 
-    DESCRIPTION_COLUMN, 
-    GRANITE_DESCRIPTION_EMBEDDING_COLUMN,
+    DESCRIPTION_COLUMN,
     RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN,
     ID_COLUMN
 )
@@ -61,8 +59,8 @@ def find_available_models():
     
     # Search in the models directory and current directory
     search_paths = [
-        "../models",
-        "."
+        r"../models",
+        r"."
     ]
     
     for path in search_paths:
@@ -83,6 +81,8 @@ def detect_model_type(model_file):
     filename = os.path.basename(model_file).lower()
     if 'dccav3' in filename:
         return "dccav3"
+    if "dccav2" in filename:
+        return "dccav2"
     if 'dccae' in filename or 'dcca' in filename:
         return "dcca"
     else:
@@ -218,7 +218,7 @@ def load_model(model_file):
     
     model_type = detect_model_type(model_file)
     
-    if model_type in ["dcca", "dccav3"]:
+    if model_type in ["dcca", "dccav2", "dccav3"]:
         # Load DCCA-family model
         logger.info(f"Loading {model_type.upper()} model from {model_file}...")
         try:
@@ -242,6 +242,8 @@ def load_model(model_file):
                     st.error("DCCAV3 model file detected but DCCAV3 module not importable.")
                     return None, None, None, None
                 model = create_dcca_v3_model(state_dict=state_dict)
+            elif model_type == "dccav2":
+                model = create_dcca_v2_model(state_dict=state_dict)
             else: # dcca
                 model = create_dcca_model(state_dict=state_dict)
 
@@ -264,9 +266,7 @@ def load_model(model_file):
     else:  # finetuned model
         # Load fine-tuned Voice2Embedding model
         logger.info(f"Loading fine-tuned Voice2Embedding model from {model_file}...")
-        voice_encoder = VoiceEncoder(device=device)
-        dense_embedding_model = SentenceTransformer("ibm-granite/granite-embedding-125m-english")
-        model = Voice2Embedding(voice_encoder, projection_dim=dense_embedding_model.get_sentence_embedding_dimension())
+        model = Voice2Embedding()
         
         try:
             checkpoint = torch.load(model_file, map_location=device)
@@ -301,7 +301,7 @@ def load_model(model_file):
 def extract_audio_embedding(audio_data, model, device, model_type="finetuned"):
     """Extract audio embedding using either DCCA or fine-tuned model"""
     try:
-        if model_type in ["dcca", "dccav3"]:
+        if model_type in ["dcca", "dccav2", "dccav3"]:
             # For DCCA-family, we expect precomputed embeddings in the dataset
             # This function is mainly for compatibility
             logger.warning(f"extract_audio_embedding called for {model_type.upper()} model - should use precomputed embeddings")
@@ -324,7 +324,7 @@ def extract_audio_embedding(audio_data, model, device, model_type="finetuned"):
 def extract_text_embedding(text, text_model, model_type="finetuned"):
     """Extract text embedding - works for both model types"""
     with torch.no_grad():
-        if model_type in ["dcca", "dccav3"]:
+        if model_type in ["dcca", "dccav2", "dccav3"]:
             # For DCCA-family, encode text and then pass through model
             text_embedding = text_model.encode([text], convert_to_tensor=True)
             return text_embedding.cpu().numpy()
@@ -388,7 +388,7 @@ def precompute_voice_embeddings(_dataset, model, device, model_type="finetuned")
             status_text.text(f"Processing sample {i}/{total_samples} ({progress * 100:.1f}%)")
 
         # Extract audio embedding based on model type
-        if model_type in ["dcca", "dccav3"]:
+        if model_type in ["dcca", "dccav2", "dccav3"]:
             # For DCCA model, use precomputed resemblyzer embeddings from dataset
             if RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN in sample:
                 # Use precomputed resemblyzer embeddings from dataset
@@ -445,7 +445,7 @@ def find_similar_voices(model, text_model, device):
     query_embedding = None
 
     if search_type == "text" and st.session_state.search_text:
-        if model_type in ["dcca", "dccav3"]:
+        if model_type in ["dcca", "dccav2", "dccav3"]:
             # For DCCA, encode text and pass through model
             try:
                 raw_text_embedding = text_model.encode([st.session_state.search_text], convert_to_tensor=True, device=device)
@@ -465,7 +465,7 @@ def find_similar_voices(model, text_model, device):
             logger.info(f"Fine-tuned text query embedding shape: {query_embedding.shape if query_embedding is not None else 'None'}")
             
     elif search_type == "audio" and st.session_state.uploaded_audio:
-        if model_type in ["dcca", "dccav3"]:
+        if model_type in ["dcca", "dccav2", "dccav3"]:
             # For DCCA, would need to extract resemblyzer embedding from uploaded audio and process it
             # This is more complex and might require additional processing
             st.error(f"Audio search with {model_type.upper()} models is not yet fully implemented for uploaded files")
@@ -588,7 +588,7 @@ with search_tab:
             uploaded_file = None
         else:
             # Show warning for DCCA models with audio upload
-            if model_type in ["dcca", "dccav3"]:
+            if model_type in ["dcca", "dccav2", "dccav3"]:
                 st.warning("⚠️ Audio upload search is limited with DCCA models. Text search is recommended.")
             
             uploaded_file = st.file_uploader("Upload an audio sample of the voice (WAV, MP3, or OGG format)",

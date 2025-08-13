@@ -8,6 +8,7 @@ from create_dataset import GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLU
 import os
 from DCCA import create_dcca_model, DCCA_MODEL_PATH
 from DCCAV2 import create_dcca_v2_model, DCCA_V2_MODEL_PATH
+from DCCAV3 import create_dcca_v3_model, DCCA_V3_MODEL_PATH
 from Voice2Embedding import Voice2Embedding, VOICE2EMBEDDING_MODEL_PATH
 import pandas as pd
 
@@ -18,7 +19,7 @@ BATCH_SIZE = 32
 NUM_EPOCHS = 50
 LEARNING_RATE = 1e-3
 
-MODEL_TYPES = ["dccav2", "dcca", "voice2embedding", "baseline"]
+MODEL_TYPES = ["dccav3", "dccav2", "dcca", "voice2embedding", "baseline"]
 CLASS_TYPES = [GENDER_COLUMN, AGE_COLUMN, PITCH_COLUMN, EMOTION_COLUMN, SPEED_COLUMN, ENERGY_COLUMN]
 
 class FeatureClassificationDataset(Dataset):
@@ -196,6 +197,14 @@ def run_test(class_title, model_type):
         speech_encoder = model.encode_speech
         description_encoder = model.encode_text
 
+    elif model_type == "dccav3":
+        # Load the trained DCCAE model
+        model_state_dict = torch.load(DCCA_V3_MODEL_PATH, map_location=DEVICE)["model_state_dict"]
+        model = create_dcca_v3_model(state_dict=model_state_dict)
+        model.eval()
+        speech_encoder = model.encode_speech
+        description_encoder = model.encode_text
+
     elif model_type == "voice2embedding":
         model_state_dict = torch.load(VOICE2EMBEDDING_MODEL_PATH, map_location=DEVICE)["model_state_dict"]
         model = Voice2Embedding()
@@ -304,7 +313,7 @@ def summarize_results():
         df = pd.DataFrame(reduced_results)
 
         # Write all accumulated data to text file
-        output_file = "../results/results_summary.txt"
+        output_file = "../results/ClassifierEvaluation_results_summary.txt"
         with open(output_file, "w") as f:
             f.write(df.to_string(index=False))
 
