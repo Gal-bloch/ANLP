@@ -35,6 +35,7 @@ from tempfile import NamedTemporaryFile
 import json
 import pickle
 import random
+from typing import Optional
 
 # Initialize session state for human evaluation
 if 'precomputed_embeddings' not in st.session_state:
@@ -89,6 +90,10 @@ if 'correct_evaluations' not in st.session_state:
     st.session_state.correct_evaluations = 0
 if 'evaluation_complete' not in st.session_state:
     st.session_state.evaluation_complete = False
+if 'evaluation_started' not in st.session_state:
+    st.session_state.evaluation_started = False
+if 'evaluation_history' not in st.session_state:  # stack for undo
+    st.session_state.evaluation_history = []
 
 # Set the audio cache directory and embeddings cache file
 AUDIO_CACHE_DIR = "./audio_cache"
@@ -390,66 +395,65 @@ def cosine_similarity(emb1, emb2):
     return sim.mean().item()
 
 
+def l2_normalize(x: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
+    return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+
 def precompute_voice_embeddings(_dataset, model, device, model_type="finetuned", model_file=None):
-    """Precompute voice embeddings for all samples in the dataset"""
+    """Precompute (and cache) voice embeddings.
+    For DCCA-family models we now also precompute the model.encode_speech() outputs once,
+    matching the retrieval evaluation logic (encode all speech embeddings first, then reuse).
+    """
     logger.info(f"Preparing voice embeddings for {model_type} model...")
-    
-    # Use the full test dataset, but limit to available samples
     test_dataset = _dataset['test']
-    max_samples = min(len(test_dataset), 10000)  # Use available samples, max 10000
+    max_samples = min(len(test_dataset), 10000)
     limited_dataset = test_dataset.select(range(max_samples))
-    
+
     precomputed_embeddings = []
     total_samples = len(limited_dataset)
-
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    if model_type in {"dcca", "dccav2", "dccav3"}:
-        # For DCCA, use precomputed embeddings from the dataset
-        logger.info("Using precomputed embeddings from dataset for DCCA model")
-        
-        for i, sample in enumerate(limited_dataset):
-            if i % 10 == 0:
-                progress = min(i / total_samples, 1.0)
-                progress_bar.progress(progress)
-                status_text.text(f"Processing sample {i}/{total_samples} ({progress * 100:.1f}%)")
-
-            # Use precomputed resemblyzer embeddings from dataset
-            if RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN in sample:
-                audio_embedding = np.array(sample[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN]).reshape(1, -1)
-                
-                precomputed_embeddings.append({
-                    'index': i,
-                    'description': sample[DESCRIPTION_COLUMN],
-                    'audio': sample[AUDIO_COLUMN],
-                    'embedding': audio_embedding,
-                    'precomputed_text_embedding': np.array(sample.get(GRANITE_DESCRIPTION_EMBEDDING_COLUMN, [])).reshape(1, -1) if GRANITE_DESCRIPTION_EMBEDDING_COLUMN in sample else None
-                })
-    else:
-        # For fine-tuned model, compute embeddings in real-time
-        logger.info("Computing embeddings in real-time for fine-tuned model")
-        
-        for i, sample in enumerate(limited_dataset):
-            if i % 10 == 0:
-                progress = min(i / total_samples, 1.0)
-                progress_bar.progress(progress)
-                status_text.text(f"Processing sample {i}/{total_samples} ({progress * 100:.1f}%)")
-
-            audio_embedding = extract_audio_embedding(sample['audio'], model, device, model_type)
-            if audio_embedding is not None:
-                precomputed_embeddings.append({
-                    'index': i,
-                    'description': sample[DESCRIPTION_COLUMN],
-                    'audio': sample[AUDIO_COLUMN],
-                    'embedding': audio_embedding
-                })
+    with torch.no_grad():
+        if model_type in {"dcca", "dccav2", "dccav3"}:
+            logger.info("Using precomputed resemblyzer embeddings and encoding them once with the model (DCCA-family)")
+            for i, sample in enumerate(limited_dataset):
+                if i % 10 == 0:
+                    progress_bar.progress(min(i / total_samples, 1.0))
+                    status_text.text(f"Processing sample {i}/{total_samples} ({i / total_samples * 100:.1f}%)")
+                if RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN in sample:
+                    raw_audio_emb = np.array(sample[RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN], dtype=np.float32)  # (256,)
+                    raw_audio_emb_t = torch.from_numpy(raw_audio_emb).unsqueeze(0).to(device)  # (1, D)
+                    encoded_audio = model.encode_speech(raw_audio_emb_t)  # (1, d')
+                    # L2 normalize encoded embeddings for stable cosine similarity (mirrors typical retrieval setups)
+                    encoded_audio = l2_normalize(encoded_audio).cpu().numpy()
+                    precomputed_embeddings.append({
+                        'index': i,
+                        'description': sample[DESCRIPTION_COLUMN],
+                        'audio': sample[AUDIO_COLUMN],
+                        'raw_embedding': raw_audio_emb.reshape(1, -1),
+                        'encoded_embedding': encoded_audio,  # cached model projection
+                        'precomputed_text_embedding': np.array(sample.get(GRANITE_DESCRIPTION_EMBEDDING_COLUMN, []), dtype=np.float32).reshape(1, -1) if GRANITE_DESCRIPTION_EMBEDDING_COLUMN in sample else None
+                    })
+        else:
+            logger.info("Computing fine-tuned model audio embeddings in real-time")
+            for i, sample in enumerate(limited_dataset):
+                if i % 10 == 0:
+                    progress_bar.progress(min(i / total_samples, 1.0))
+                    status_text.text(f"Processing sample {i}/{total_samples} ({i / total_samples * 100:.1f}%)")
+                audio_embedding = extract_audio_embedding(sample['audio'], model, device, model_type)
+                if audio_embedding is not None:
+                    precomputed_embeddings.append({
+                        'index': i,
+                        'description': sample[DESCRIPTION_COLUMN],
+                        'audio': sample[AUDIO_COLUMN],
+                        'embedding': audio_embedding  # already final space for fine-tuned model
+                    })
 
     progress_bar.progress(1.0)
     status_text.text(f"✅ Prepared {len(precomputed_embeddings)} voice embeddings")
-    logger.info(f"✅ Successfully prepared {len(precomputed_embeddings)} voice embeddings for {model_type} model")
+    logger.info(f"✅ Prepared {len(precomputed_embeddings)} embeddings for {model_type}")
 
-    # Save to cache
     if model_file:
         cache_file = get_embeddings_cache_file(model_file)
         save_embeddings_to_cache(precomputed_embeddings, cache_file)
@@ -458,87 +462,114 @@ def precompute_voice_embeddings(_dataset, model, device, model_type="finetuned",
 
 
 def search_for_description(description, top_k=3, model_type="finetuned", model=None, text_model=None, device=None):
-    """Search for voices matching a description (no diversification on similarity collapse)."""
-    
-    if model_type in {"dcca", "dccav2", "dccav3"}:
-        raw_text_embedding = text_model.encode([description], convert_to_tensor=True, device=device)
-        with torch.no_grad():
-            text_tensor = raw_text_embedding.to(device)
-            query_embedding = model.encode_text(text_tensor).cpu().numpy()
-        logger.info(f"DCCA-family query embedding shape: {query_embedding.shape}, mean: {query_embedding.mean():.4f}, std: {query_embedding.std():.4f}")
-    else:
-        query_embedding = extract_text_embedding(description, text_model, model_type)
-    if query_embedding is None:
-        return []
+    """Search for voices matching a description using consistent encoded representations.
+    DCCA-family: use cached encoded speech embeddings (model.encode_speech precomputed) + model.encode_text(query).
+    Fine-tuned: existing behavior.
+    """
+    with torch.no_grad():
+        if model_type in {"dcca", "dccav2", "dccav3"}:
+            raw_text_embedding = text_model.encode([description], convert_to_tensor=True, device=device)  # (1, D_in)
+            query_embedding = model.encode_text(raw_text_embedding.to(device))  # (1, d')
+            query_embedding = l2_normalize(query_embedding).cpu().numpy()
+        else:
+            query_embedding = extract_text_embedding(description, text_model, model_type)
+            if query_embedding is None:
+                return []
 
     results = []
     similarities = []
     for i, item in enumerate(st.session_state.precomputed_embeddings):
         if model_type in {"dcca", "dccav2", "dccav3"}:
-            if 'embedding' in item:
-                audio_embedding_tensor = torch.tensor(item['embedding'], dtype=torch.float32).to(device)
+            encoded_audio = item.get('encoded_embedding')
+            if encoded_audio is None:
+                # Fallback (should not happen once precomputed): encode on the fly
+                raw_audio = item.get('raw_embedding')
+                if raw_audio is None:
+                    continue
                 with torch.no_grad():
-                    processed_audio_embedding = model.encode_speech(audio_embedding_tensor).cpu().numpy()
-                if i < 3:
-                    logger.info(f"DCCA-family audio emb {i} -> processed shape {processed_audio_embedding.shape}, mean {processed_audio_embedding.mean():.4f}, std {processed_audio_embedding.std():.4f}")
-                similarity = cosine_similarity(query_embedding, processed_audio_embedding)
-                similarities.append(similarity)
-            else:
-                similarity = 0
+                    encoded_audio = model.encode_speech(torch.tensor(raw_audio, dtype=torch.float32, device=device))
+                    encoded_audio = l2_normalize(encoded_audio).cpu().numpy()
+            similarity = cosine_similarity(query_embedding, encoded_audio)
+            similarities.append(similarity)
+            results.append({'index': item['index'], 'description': item['description'], 'similarity': similarity, 'audio': item['audio']})
         else:
             similarity = cosine_similarity(query_embedding, item['embedding'])
             similarities.append(similarity)
-        results.append({'index': item['index'], 'description': item['description'], 'similarity': similarity, 'audio': item['audio']})
+            results.append({'index': item['index'], 'description': item['description'], 'similarity': similarity, 'audio': item['audio']})
 
     if similarities:
-        similarities_array = np.array(similarities)
-        logger.info(f"Similarity stats - min: {similarities_array.min():.4f}, max: {similarities_array.max():.4f}, mean: {similarities_array.mean():.4f}, std: {similarities_array.std():.4f}")
-        logger.info(f"Unique similarities: {len(np.unique(similarities_array))}/{len(similarities_array)}")
+        sims = np.array(similarities)
+        logger.info(f"Similarity stats - min:{sims.min():.4f} max:{sims.max():.4f} mean:{sims.mean():.4f} std:{sims.std():.4f}")
 
     results.sort(key=lambda x: x['similarity'], reverse=True)
     return results[:top_k]
 
 
 def get_next_evaluation(model_type="finetuned", model=None, text_model=None, device=None):
-    """Get the next audio sample to evaluate"""
-    if st.session_state.current_description_idx >= len(st.session_state.character_descriptions):
-        st.session_state.evaluation_complete = True
-        return None, None, None
+    """Get the next audio sample to evaluate.
+    Skips descriptions that yield no retrieval results instead of prematurely completing.
+    Returns (desc, result, rank) or (None, None, None) if no more valid items.
+    """
+    max_desc = len(st.session_state.character_descriptions)
 
-    # If we need new results for current description
-    if not st.session_state.current_results or st.session_state.current_result_idx >= len(
-            st.session_state.current_results):
-        if st.session_state.current_result_idx >= len(st.session_state.current_results):
-            # Move to next description
-            st.session_state.current_description_idx += 1
-            st.session_state.current_result_idx = 0
+    # Attempt to find next description with non-empty retrieval
+    while st.session_state.current_description_idx < max_desc:
+        # Need (new) results?
+        need_new = (not st.session_state.current_results) or (st.session_state.current_result_idx >= len(st.session_state.current_results))
+        if need_new:
+            # Move to next description if we already exhausted current results
+            if st.session_state.current_results and st.session_state.current_result_idx >= len(st.session_state.current_results):
+                st.session_state.current_description_idx += 1
+                st.session_state.current_result_idx = 0
+                st.session_state.current_results = []
+                continue  # evaluate loop condition
 
-            if st.session_state.current_description_idx >= len(st.session_state.character_descriptions):
-                st.session_state.evaluation_complete = True
-                return None, None, None
+            # Fetch results for current description
+            if st.session_state.current_description_idx < max_desc:
+                desc = st.session_state.character_descriptions[st.session_state.current_description_idx]
+                st.session_state.current_results = search_for_description(
+                    desc, top_k=3, model_type=model_type, model=model,
+                    text_model=text_model, device=device
+                )
+                st.session_state.current_result_idx = 0
 
-        # Get results for current description
-        current_desc = st.session_state.character_descriptions[st.session_state.current_description_idx]
-        st.session_state.current_results = search_for_description(
-            current_desc, top_k=3, model_type=model_type, model=model, 
-            text_model=text_model, device=device
-        )
+                # If no results for this description, skip it
+                if not st.session_state.current_results:
+                    logging.warning(f"No retrieval results for description index {st.session_state.current_description_idx}; skipping.")
+                    st.session_state.current_description_idx += 1
+                    st.session_state.current_results = []
+                    continue
 
-    if st.session_state.current_result_idx < len(st.session_state.current_results):
-        current_desc = st.session_state.character_descriptions[st.session_state.current_description_idx]
-        current_result = st.session_state.current_results[st.session_state.current_result_idx]
-        return current_desc, current_result, st.session_state.current_result_idx
+        # If we have results now
+        if st.session_state.current_results and st.session_state.current_result_idx < len(st.session_state.current_results):
+            desc = st.session_state.character_descriptions[st.session_state.current_description_idx]
+            res = st.session_state.current_results[st.session_state.current_result_idx]
+            return desc, res, st.session_state.current_result_idx
 
+        # Otherwise advance
+        st.session_state.current_description_idx += 1
+        st.session_state.current_results = []
+        st.session_state.current_result_idx = 0
+
+    # Exhausted all descriptions
+    st.session_state.evaluation_complete = True
     return None, None, None
 
 
 def record_evaluation(matches):
-    """Record user evaluation"""
+    """Record user evaluation and push state to history for potential re-evaluation (undo)."""
+    # Snapshot before advancing
+    history_entry = {
+        'description_idx': st.session_state.current_description_idx,
+        'result_idx': st.session_state.current_result_idx,
+        'matches': matches,
+        'results_snapshot': st.session_state.current_results.copy()
+    }
+
     st.session_state.total_evaluations += 1
     if matches:
         st.session_state.correct_evaluations += 1
 
-    # Store evaluation data
     current_desc = st.session_state.character_descriptions[st.session_state.current_description_idx]
     current_result = st.session_state.current_results[st.session_state.current_result_idx]
 
@@ -550,7 +581,8 @@ def record_evaluation(matches):
         'result_rank': st.session_state.current_result_idx + 1
     })
 
-    # Move to next result
+    st.session_state.evaluation_history.append(history_entry)
+
     st.session_state.current_result_idx += 1
 
 
@@ -675,6 +707,8 @@ if selected_model_file != st.session_state.selected_model_file:
     st.session_state.total_evaluations = 0
     st.session_state.correct_evaluations = 0
     st.session_state.evaluation_complete = False
+    st.session_state.evaluation_started = False
+    st.session_state.evaluation_history = []  # Reset history stack
     
     st.info("🔄 Model changed - evaluation reset. You'll start fresh with the new model.")
     st.rerun()
@@ -763,10 +797,10 @@ else:
     st.write(f"Progress: {current_progress}/{total_possible} evaluations completed")
 
     if not st.session_state.evaluation_complete:
-        # Get next evaluation
         description, result, rank = get_next_evaluation(model_type, model, text_model, device)
 
         if description and result:
+            st.session_state.evaluation_started = True
             st.subheader("Evaluation Task")
 
             # Show the description (what we're looking for)
@@ -805,11 +839,13 @@ else:
                     "**Note:** This is the original description from the dataset. Base your evaluation only on what you hear and the target description above.")
 
         else:
-            # No more samples: finalize automatically instead of showing an error
-            st.session_state.evaluation_complete = True
-            results = save_evaluation_results()
-            st.success("🎉 Evaluation complete! Summary saved to 'human_evaluation_results.json'.")
-            st.json(results)
+            if st.session_state.evaluation_started:
+                st.session_state.evaluation_complete = True
+                results = save_evaluation_results()
+                st.success("🎉 Evaluation complete! Summary saved to 'human_evaluation_results.json'.")
+                st.json(results)
+            else:
+                st.warning("No retrievable results were found for any descriptions. Ensure embeddings were computed and are non-empty.")
             st.stop()
 
     else:
@@ -830,11 +866,14 @@ else:
             st.json(results)
 
         if st.button("Start New Evaluation"):
-            # Reset all session state
             for key in ['current_description_idx', 'current_results', 'current_result_idx',
-                        'evaluation_data', 'total_evaluations', 'correct_evaluations', 'evaluation_complete']:
-                st.session_state[
-                    key] = 0 if 'idx' in key or 'evaluations' in key else [] if 'data' in key or 'results' in key else False
+                        'evaluation_data', 'total_evaluations', 'correct_evaluations', 'evaluation_complete', 'evaluation_started']:
+                if key in ['current_description_idx', 'current_result_idx', 'total_evaluations', 'correct_evaluations']:
+                    st.session_state[key] = 0
+                elif key in ['current_results', 'evaluation_data']:
+                    st.session_state[key] = []
+                elif key in ['evaluation_complete', 'evaluation_started']:
+                    st.session_state[key] = False
             st.rerun()
 
     # Show evaluation statistics
@@ -857,3 +896,22 @@ else:
                 st.write(f"- *{desc}*: {stats['correct']}/{stats['total']} ({acc:.1f}%)")
         else:
             st.write("No evaluation data yet.")
+
+# Sidebar undo / re-evaluate option (only if at least one evaluation recorded and not currently showing first untouched item)
+if st.session_state.evaluation_history:
+    if st.sidebar.button("↩️ Re-evaluate (Undo Last)"):
+        last = st.session_state.evaluation_history.pop()
+        # Remove last evaluation data entry
+        if st.session_state.evaluation_data:
+            st.session_state.evaluation_data.pop()
+        # Adjust counters
+        st.session_state.total_evaluations = max(0, st.session_state.total_evaluations - 1)
+        if last['matches'] and st.session_state.correct_evaluations > 0:
+            st.session_state.correct_evaluations -= 1
+        # Restore indices/state
+        st.session_state.current_description_idx = last['description_idx']
+        st.session_state.current_results = last['results_snapshot']
+        st.session_state.current_result_idx = last['result_idx']
+        st.session_state.evaluation_complete = False
+        st.session_state.evaluation_started = bool(st.session_state.evaluation_history)
+        st.rerun()
