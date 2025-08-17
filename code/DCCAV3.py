@@ -134,7 +134,7 @@ class DCCAV3SpeechText(nn.Module):
         return loss
 
     @staticmethod
-    def loss(audio_encodings, text_encodings, neg_text_encodings, temperature=TEMPERATURE):
+    def loss(audio_encodings, text_encodings, temperature=TEMPERATURE):
         # Symmetric InfoNCE loss
         loss_audio_text = DCCAV3SpeechText.info_nce_loss(audio_encodings, text_encodings, temperature)
         loss_text_audio = DCCAV3SpeechText.info_nce_loss(text_encodings, audio_encodings, temperature)
@@ -207,9 +207,8 @@ def train():
             
             audio_encoding = model.encode_speech(audio_emb)
             desc_encoding = model.encode_text(desc_emb)
-            neg_desc_encoding = model.encode_text(neg_desc_emb)
             
-            loss = model.loss(audio_encoding, desc_encoding, neg_desc_encoding)
+            loss = model.loss(audio_encoding, desc_encoding)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
