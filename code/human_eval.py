@@ -17,6 +17,12 @@ try:
     HAS_DCCAV3 = True
 except ImportError:
     HAS_DCCAV3 = False
+# Added optional import for V2 models
+try:
+    from DCCAV2 import create_dcca_v2_model
+    HAS_DCCAV2 = True
+except ImportError:
+    HAS_DCCAV2 = False
 from create_dataset import (
     RESEMBLYZER_SPEAKER_EMBEDDING_COLUMN, 
     GRANITE_DESCRIPTION_EMBEDDING_COLUMN,
@@ -28,6 +34,7 @@ from create_dataset import (
 from tempfile import NamedTemporaryFile
 import json
 import pickle
+import random
 
 # Initialize session state for human evaluation
 if 'precomputed_embeddings' not in st.session_state:
@@ -45,8 +52,29 @@ if 'character_descriptions' not in st.session_state:
         "A dramatic female voice with theatrical delivery",
         "A calm, soothing male narrator voice",
         "An energetic young female with fast speech",
-        "A wise elderly woman with measured speech"
+        "A wise elderly woman with measured speech",
+        "A confident male with a charismatic storyteller’s voice",
+        "A shy teenage girl with hesitant pauses",
+        "A stern female teacher with clipped, precise diction",
+        "A goofy male with exaggerated cartoon-like tone",
+        "A whispery female voice, mysterious and secretive",
+        "A booming male voice with strong projection",
+        "A sarcastic young man with dry humor in his delivery",
+        "A bubbly child with excitable, fast-paced speech",
+        "A sophisticated woman with elegant and smooth articulation",
+        "A rugged cowboy with a drawl and gravelly undertone",
+        "A friendly middle-aged woman with warmth in her tone",
+        "A tech-savvy young man with quick, casual delivery",
+        "A grandmotherly figure with sing-song intonation",
+        "A brooding young male with a low, moody tone",
+        "A heroic female warrior with strong, bold emphasis",
+        "A quirky male inventor with scattered, rushed speech",
+        "A gentle male monk with calm, meditative cadence",
+        "A regal queen with formal, commanding pronunciation",
+        "A nervous young boy with stuttering and soft volume",
+        "An enthusiastic announcer with exaggerated excitement"
     ]
+
 if 'current_description_idx' not in st.session_state:
     st.session_state.current_description_idx = 0
 if 'current_results' not in st.session_state:
@@ -94,11 +122,13 @@ def find_available_models():
 
 def detect_model_type(model_file):
     """Detect model family based on filename.
-    Priority order: dccav3 > dccae/dcca > finetuned
+    Priority order: dccav3 > dccav2 > dccae/dcca > finetuned
     """
     filename = os.path.basename(model_file).lower()
     if 'dccav3' in filename:
         return 'dccav3'
+    if 'dccav2' in filename:
+        return 'dccav2'
     if 'dccae' in filename or 'dcca' in filename:
         return 'dcca'
     return 'finetuned'
@@ -267,7 +297,7 @@ def load_model(model_file):
                 return obj  # looks like raw state dict
         return None
 
-    if model_type in {"dcca", "dccav3"}:
+    if model_type in {"dcca", "dccav2", "dccav3"}:
         state_dict = extract_state_dict(checkpoint)
         try:
             if model_type == "dccav3":
@@ -275,6 +305,11 @@ def load_model(model_file):
                     st.error("DCCAV3 model file detected but DCCAV3 module not importable.")
                     return None, None, None, None
                 model = create_dcca_v3_model(state_dict=state_dict)
+            elif model_type == "dccav2":
+                if not HAS_DCCAV2:
+                    st.error("DCCAV2 model file detected but DCCAV2 module not importable.")
+                    return None, None, None, None
+                model = create_dcca_v2_model(state_dict=state_dict)
             else:  # original dcca
                 model = create_dcca_model(state_dict=state_dict)
 
@@ -315,11 +350,9 @@ def load_model(model_file):
 def extract_audio_embedding(audio_data, model, device, model_type="finetuned"):
     """Extract audio embedding using either DCCA or fine-tuned model"""
     try:
-        if model_type in {"dcca", "dccav3"}:
-            # For DCCA-family, we expect precomputed embeddings in the dataset
+        if model_type in {"dcca", "dccav2", "dccav3"}:
             logger.warning("extract_audio_embedding called for DCCA-family model - should use precomputed embeddings")
             return None
-
         # Fine-tuned: compute embeddings in real-time
         wav, sample_rate = load_audio_file(audio_data)
         if wav is None or len(wav) == 0:
@@ -337,7 +370,7 @@ def extract_audio_embedding(audio_data, model, device, model_type="finetuned"):
 def extract_text_embedding(text, text_model, model_type="finetuned"):
     """Extract text embedding - works for both model types"""
     with torch.no_grad():
-        if model_type in {"dcca", "dccav3"}:
+        if model_type in {"dcca", "dccav2", "dccav3"}:
             text_embedding = text_model.encode([text], convert_to_tensor=True)
             return text_embedding.cpu().numpy()
         # Fine-tuned model
@@ -363,7 +396,7 @@ def precompute_voice_embeddings(_dataset, model, device, model_type="finetuned",
     
     # Use the full test dataset, but limit to available samples
     test_dataset = _dataset['test']
-    max_samples = min(len(test_dataset), 1000)  # Use available samples, max 1000
+    max_samples = min(len(test_dataset), 10000)  # Use available samples, max 10000
     limited_dataset = test_dataset.select(range(max_samples))
     
     precomputed_embeddings = []
@@ -372,7 +405,7 @@ def precompute_voice_embeddings(_dataset, model, device, model_type="finetuned",
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    if model_type in {"dcca", "dccav3"}:
+    if model_type in {"dcca", "dccav2", "dccav3"}:
         # For DCCA, use precomputed embeddings from the dataset
         logger.info("Using precomputed embeddings from dataset for DCCA model")
         
@@ -425,28 +458,25 @@ def precompute_voice_embeddings(_dataset, model, device, model_type="finetuned",
 
 
 def search_for_description(description, top_k=3, model_type="finetuned", model=None, text_model=None, device=None):
-    """Search for voices matching a description"""
+    """Search for voices matching a description (no diversification on similarity collapse)."""
     
-    if model_type in {"dcca", "dccav3"}:
-        # Encode text then pass through model encoder; preserve batch dim
+    if model_type in {"dcca", "dccav2", "dccav3"}:
         raw_text_embedding = text_model.encode([description], convert_to_tensor=True, device=device)
         with torch.no_grad():
-            text_tensor = raw_text_embedding.to(device)  # shape (1, dim)
+            text_tensor = raw_text_embedding.to(device)
             query_embedding = model.encode_text(text_tensor).cpu().numpy()
         logger.info(f"DCCA-family query embedding shape: {query_embedding.shape}, mean: {query_embedding.mean():.4f}, std: {query_embedding.std():.4f}")
     else:
-        # For fine-tuned model, just get text embedding
         query_embedding = extract_text_embedding(description, text_model, model_type)
-    
     if query_embedding is None:
         return []
 
     results = []
-    similarities = []  # Debug: collect similarities
+    similarities = []
     for i, item in enumerate(st.session_state.precomputed_embeddings):
-        if model_type in {"dcca", "dccav3"}:
+        if model_type in {"dcca", "dccav2", "dccav3"}:
             if 'embedding' in item:
-                audio_embedding_tensor = torch.tensor(item['embedding'], dtype=torch.float32).to(device)  # (1, 256)
+                audio_embedding_tensor = torch.tensor(item['embedding'], dtype=torch.float32).to(device)
                 with torch.no_grad():
                     processed_audio_embedding = model.encode_speech(audio_embedding_tensor).cpu().numpy()
                 if i < 3:
@@ -456,18 +486,10 @@ def search_for_description(description, top_k=3, model_type="finetuned", model=N
             else:
                 similarity = 0
         else:
-            # For fine-tuned model, use embeddings directly
             similarity = cosine_similarity(query_embedding, item['embedding'])
             similarities.append(similarity)
-            
-        results.append({
-            'index': item['index'],
-            'description': item['description'],
-            'similarity': similarity,
-            'audio': item['audio']
-        })
+        results.append({'index': item['index'], 'description': item['description'], 'similarity': similarity, 'audio': item['audio']})
 
-    # Debug: Print similarity statistics
     if similarities:
         similarities_array = np.array(similarities)
         logger.info(f"Similarity stats - min: {similarities_array.min():.4f}, max: {similarities_array.max():.4f}, mean: {similarities_array.mean():.4f}, std: {similarities_array.std():.4f}")
@@ -659,8 +681,13 @@ if selected_model_file != st.session_state.selected_model_file:
 
 # Model info
 st.sidebar.info(f"**Selected**: {os.path.basename(selected_model_file)}")
-if model_type in {"dcca", "dccav3"}:
-    sidebar_label = "DCCA V3" if model_type == "dccav3" else "DCCA"
+if model_type in {"dcca", "dccav2", "dccav3"}:
+    if model_type == "dccav3":
+        sidebar_label = "DCCA V3"
+    elif model_type == "dccav2":
+        sidebar_label = "DCCA V2"
+    else:
+        sidebar_label = "DCCA"
     st.sidebar.info(f"🔬 **{sidebar_label} Model**: Uses precomputed speaker embeddings; re-encoded on the fly for similarity.")
 else:
     st.sidebar.info("🎯 **Fine-tuned Model**: Computes embeddings in real-time. More flexible.")
@@ -684,14 +711,13 @@ else:
     if st.session_state.precomputed_embeddings is None:
         # Try loading from cache
         cached_embeddings = load_embeddings_from_cache(cache_file)
-
         if cached_embeddings is not None:
             st.session_state.precomputed_embeddings = cached_embeddings
             st.success(f"✅ Loaded {len(cached_embeddings)} precomputed embeddings from cache!")
         else:
             # Need to compute embeddings
-            if model_type == "dcca":
-                st.info("📁 DCCA model detected. Loading embeddings from dataset...")
+            if model_type in {"dcca", "dccav2", "dccav3"}:
+                st.info("📁 DCCA family model detected. Loading embeddings from dataset...")
                 button_text = "🔄 Load DCCA Embeddings from Dataset"
             else:
                 st.warning("No cached embeddings found. Computing embeddings...")
@@ -779,7 +805,12 @@ else:
                     "**Note:** This is the original description from the dataset. Base your evaluation only on what you hear and the target description above.")
 
         else:
-            st.error("Unable to get next evaluation sample")
+            # No more samples: finalize automatically instead of showing an error
+            st.session_state.evaluation_complete = True
+            results = save_evaluation_results()
+            st.success("🎉 Evaluation complete! Summary saved to 'human_evaluation_results.json'.")
+            st.json(results)
+            st.stop()
 
     else:
         # Evaluation complete
