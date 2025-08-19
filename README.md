@@ -37,13 +37,6 @@ datasets/                    # HuggingFace dataset on disk (train/test)
 requirements.txt             # Dependencies
 ```
 
-Checkpoint examples (root):
-| File | Purpose |
-|------|---------|
-| `best_voice2embedding_model.pt` | Fine‑tuned Voice2Embedding weights |
-| `dccae_voice_text_best.pt` / `dccae_voice_text.pt` | DCCA variants |
-| `best_wav2vec2_voice2embedding_model.pt` | wav2vec2 front‑end experiment |
-
 ---
 
 ## 🧪 Modalities & Embeddings
