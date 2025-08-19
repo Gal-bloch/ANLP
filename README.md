@@ -63,7 +63,7 @@ maximize Corr( f_audio(a), f_text(t_pos) ) - Corr( f_audio(a), f_text(t_neg) )
 ---
 
 ## 📦 Dataset Pipeline (create_dataset.py)
-1. Load base CSV metadata & labels (e.g., GigaSpeech derived).
+1. Load base CSV metadata & labels (extract csv files from datasets/SPEECHCRAFT_GIGASPEECH_CSVs.zip)
 2. Optional refinement: prompt constrains description to labeled vocal attributes.
 3. Negated description generation (attribute inversion) for hard negatives.
 4. Compute embeddings:
